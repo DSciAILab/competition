@@ -4,13 +4,14 @@ import uuid
 import urllib.parse
 import datetime as dt
 from pathlib import Path
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from PIL import Image
 
-# Face detection (compatível com cloud)
+# Face detection / hashing (compatível com cloud)
 import numpy as np
 try:
     import cv2
@@ -18,6 +19,8 @@ try:
 except Exception:
     cv2 = None
     FACE_DETECT_AVAILABLE = False
+
+import imagehash
 
 # =========================
 # CONFIG GERAL
@@ -72,7 +75,8 @@ def init_db():
             notes TEXT,
             profile_photo_path TEXT,
             id_doc_photo_path TEXT,
-            approval_status TEXT
+            approval_status TEXT,
+            face_phash TEXT
         );
         """))
         # Migrações leves (ignora se já existem)
@@ -82,7 +86,8 @@ def init_db():
             "ALTER TABLE registrations ADD COLUMN full_name_en TEXT",
             "ALTER TABLE registrations ADD COLUMN coach_phone TEXT",
             "ALTER TABLE registrations ADD COLUMN age_years INTEGER",
-            "ALTER TABLE registrations ADD COLUMN approval_status TEXT"
+            "ALTER TABLE registrations ADD COLUMN approval_status TEXT",
+            "ALTER TABLE registrations ADD COLUMN face_phash TEXT"
         ]:
             try:
                 conn.execute(text(alter))
@@ -122,6 +127,12 @@ def count_by_category(category_value: str):
         except Exception:
             return 0
 
+def update_registration(reg_id: str, updates: dict):
+    placeholders = ", ".join([f"{k} = :{k}" for k in updates.keys()])
+    updates["id"] = reg_id
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE registrations SET {placeholders} WHERE id = :id"), updates)
+
 # =========================
 # UTIL: salvar imagem
 # =========================
@@ -135,7 +146,7 @@ def save_image(file, reg_id: str, suffix: str, max_size=(800, 800)) -> str:
     return str(dest)
 
 # =========================
-# FACE DETECTION
+# FACE DETECTION / PHASH
 # =========================
 def count_faces_in_image(file) -> int:
     """
@@ -156,6 +167,41 @@ def count_faces_in_image(file) -> int:
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
     return 0 if faces is None else len(faces)
 
+def crop_face_from_uploaded(file):
+    """
+    Tenta recortar o rosto principal. Se não conseguir (ou cv2 indisponível),
+    retorna a imagem inteira em RGB (PIL.Image).
+    """
+    if file is None:
+        return None
+    data = file.getvalue()
+    img_pil = Image.open(BytesIO(data)).convert("RGB")
+
+    if FACE_DETECT_AVAILABLE:
+        np_arr = np.frombuffer(data, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80,80))
+            if faces is not None and len(faces) > 0:
+                x,y,w,h = max(faces, key=lambda r: r[2]*r[3])
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img_pil = Image.fromarray(rgb).crop((x, y, x+w, y+h))
+    return img_pil
+
+def compute_phash(img_pil: Image.Image) -> str:
+    """Calcula o perceptual hash (hex) de uma imagem PIL."""
+    if img_pil is None:
+        return ""
+    return str(imagehash.phash(img_pil))
+
+def phash_distance(hex_a: str, hex_b: str) -> int:
+    """Distância de Hamming entre dois pHashes hex."""
+    if not hex_a or not hex_b:
+        return 1_000_000
+    return imagehash.hex_to_hash(hex_a) - imagehash.hex_to_hash(hex_b)
+
 # =========================
 # NORMALIZAÇÃO / VALIDAÇÃO
 # =========================
@@ -163,7 +209,6 @@ def squeeze_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 def title_capitalize(s: str) -> str:
-    # Somente a primeira letra de cada palavra maiúscula
     return " ".join([w.capitalize() for w in squeeze_spaces(s).split(" ")])
 
 def normalize_academy(s: str) -> str:
@@ -279,7 +324,7 @@ whatsapp_phone = st.sidebar.text_input("WhatsApp da organização (com DDI)", va
 logo_file = st.sidebar.file_uploader("Logo/Banner do evento (PNG/JPG)", type=["png", "jpg", "jpeg"])
 
 st.sidebar.markdown("---")
-page = st.sidebar.radio("Página", ["Formulário", "Estatísticas"], index=0)
+page = st.sidebar.radio("Página", ["Formulário", "Estatísticas", "Alterar Inscrição"], index=0)
 
 # =========================
 # Botão flutuante WhatsApp
@@ -420,6 +465,133 @@ def stats_view():
         pivot_belt = df.pivot_table(index="category", columns="belt", values="id", aggfunc="count", fill_value=0)
         st.dataframe(pivot_belt, use_container_width=True)
 
+def update_view():
+    st.title("Alterar Inscrição – Identificação por Foto")
+    df = fetch_all()
+    if df.empty:
+        st.info("Não há inscrições para alterar.")
+        return
+
+    st.write("Envie **uma selfie recente do atleta** para localizar o cadastro:")
+    col1, col2 = st.columns(2)
+    with col1:
+        selfie_cam = st.camera_input("Tirar foto agora")
+    with col2:
+        selfie_file = st.file_uploader("Ou enviar uma foto (JPG/PNG)", type=["jpg","jpeg","png"])
+
+    query_file = selfie_cam or selfie_file
+    if not query_file:
+        st.stop()
+
+    # phash da selfie (de rosto se possível)
+    q_crop = crop_face_from_uploaded(query_file)
+    q_hash = compute_phash(q_crop)
+    if not q_hash:
+        st.error("Não foi possível processar a imagem enviada. Tente outra foto, com o rosto bem visível.")
+        st.stop()
+
+    dfc = df[df["face_phash"].notna() & (df["face_phash"]!="")].copy()
+    if dfc.empty:
+        st.warning("Nenhuma inscrição possui pHash salvo (cadastros antigos). Faça uma nova inscrição para esse atleta.")
+        st.stop()
+
+    dfc["distance"] = dfc["face_phash"].apply(lambda h: phash_distance(h, q_hash))
+    dfc = dfc.sort_values("distance").reset_index(drop=True)
+
+    best = dfc.iloc[0]
+    threshold = 8  # ajuste fino
+    st.write("Melhor correspondência encontrada:")
+    st.write({
+        "Nome": f"{best.get('first_name','')} {best.get('last_name','')}",
+        "ID": best.get("id",""),
+        "E-mail": best.get("email",""),
+        "Academia": best.get("academy",""),
+        "Distância": int(best["distance"])
+    })
+
+    if int(best["distance"]) > threshold:
+        st.warning("A correspondência não é forte o suficiente. Confirme manualmente se este é o atleta correto antes de alterar.")
+    confirm = st.checkbox("Confirmo que este é o atleta correto")
+
+    if not confirm:
+        st.write("Outras possíveis correspondências:")
+        st.dataframe(dfc[["first_name","last_name","id","email","academy","distance"]].head(3), use_container_width=True)
+        st.stop()
+
+    st.markdown("---")
+    st.subheader("Editar dados do atleta")
+
+    # formulário de edição
+    with st.form(f"edit_form_{best['id']}", clear_on_submit=False):
+        ef_first_name = st.text_input("Nome", value=best.get("first_name",""))
+        ef_last_name  = st.text_input("Sobrenome", value=best.get("last_name",""))
+        ef_email      = st.text_input("E-mail", value=best.get("email",""))
+        ef_phone      = st.text_input("Telefone (05_-___-____)", value=best.get("phone",""))
+        ef_nationality= st.text_input("Nacionalidade", value=best.get("nationality",""))
+        ef_gender     = st.selectbox("Gênero", ["Masculino","Feminino"], index=0 if best.get("gender","Masculino")=="Masculino" else 1)
+
+        # Modalidade e dependentes
+        ef_modality   = st.selectbox("Modalidade", MODALIDADES, index=0 if best.get("modality","Gi")=="Gi" else 1)
+        belt_opts     = belts_for(ef_modality)
+        try:
+            belt_index = belt_opts.index(best.get("belt", belt_opts[0]))
+        except ValueError:
+            belt_index = 0
+        ef_belt       = st.selectbox("Faixa", belt_opts, index=belt_index)
+
+        weight_opts   = weight_options(ef_modality, ef_gender)
+        try:
+            weight_index = weight_opts.index(best.get("weight_class", weight_opts[0]))
+        except ValueError:
+            weight_index = 0
+        ef_weight     = st.selectbox("Peso", weight_opts, index=weight_index)
+
+        ef_academy    = st.text_input("Academia", value=best.get("academy",""))
+        ef_coach      = st.text_input("Professor/Coach", value=best.get("coach",""))
+        ef_coach_phone= st.text_input("Telefone do Professor", value=best.get("coach_phone",""))
+
+        st.markdown("Opcional: enviar nova foto de perfil para substituir")
+        new_profile = st.camera_input("Nova foto de perfil") or st.file_uploader("Ou enviar arquivo", type=["jpg","jpeg","png"])
+
+        submitted_update = st.form_submit_button("Salvar alterações")
+
+    if submitted_update:
+        # normalizações
+        ef_first_name = title_capitalize(ef_first_name)
+        ef_last_name  = title_capitalize(ef_last_name)
+        ef_academy    = normalize_academy(ef_academy)
+        ef_phone      = clean_and_format_phone_final(ef_phone)
+        ef_coach_phone= clean_and_format_phone_final(ef_coach_phone)
+
+        updates = {
+            "first_name": ef_first_name,
+            "last_name": ef_last_name,
+            "full_name_en": translate_to_english(f"{ef_first_name} {ef_last_name}"),
+            "email": ef_email.strip(),
+            "phone": ef_phone,
+            "nationality": ef_nationality,
+            "gender": ef_gender,
+            "academy": ef_academy,
+            "coach": title_capitalize(ef_coach),
+            "coach_phone": ef_coach_phone,
+            "modality": ef_modality,
+            "belt": ef_belt,
+            "weight_class": ef_weight,
+        }
+
+        if new_profile is not None:
+            reg_id = best["id"]
+            new_path = save_image(new_profile, reg_id, "profile")
+            updates["profile_photo_path"] = new_path
+            crop = crop_face_from_uploaded(new_profile)
+            updates["face_phash"] = compute_phash(crop)
+
+        try:
+            update_registration(best["id"], updates)
+            st.success("Registro atualizado com sucesso.")
+        except Exception as e:
+            st.error(f"Erro ao atualizar: {e}")
+
 # =========================
 # ROTEAMENTO
 # =========================
@@ -435,6 +607,12 @@ if page == "Estatísticas":
     stats_view()
     st.stop()
 
+if page == "Alterar Inscrição":
+    if logo_file is not None:
+        st.image(logo_file, use_container_width=True)
+    update_view()
+    st.stop()
+
 # =========================
 # CABEÇALHO
 # =========================
@@ -445,7 +623,7 @@ else:
     st.markdown(f"<p style='text-align:center;margin-top:4px;color:#777'>{region}</p>", unsafe_allow_html=True)
 
 # =========================
-# PRÉ-MÁSCARA (sem callbacks) PARA CAMPOS DE TELEFONE
+# PRÉ-MÁSCARA (sem callbacks) PARA TELEFONES
 # =========================
 if "phone" in st.session_state:
     st.session_state["phone"] = format_phone_live(st.session_state["phone"])
@@ -611,6 +789,10 @@ if submitted:
     profile_photo_path = save_image(st.session_state["profile_img"], reg_id, "profile")
     id_doc_photo_path = save_image(st.session_state["id_doc_img"], reg_id, "id_doc")
 
+    # pHash do rosto (ou imagem inteira) para futuras alterações por selfie
+    face_crop_img = crop_face_from_uploaded(st.session_state["profile_img"])
+    face_phash = compute_phash(face_crop_img)
+
     row = {
         "id": reg_id,
         "created_at": dt.datetime.utcnow().isoformat(),
@@ -637,7 +819,8 @@ if submitted:
         "notes": (st.session_state.get("notes") or "").strip(),
         "profile_photo_path": profile_photo_path,
         "id_doc_photo_path": id_doc_photo_path,
-        "approval_status": "Pending"
+        "approval_status": "Pending",
+        "face_phash": face_phash
     }
 
     try:
