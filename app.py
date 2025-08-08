@@ -10,7 +10,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from PIL import Image
 
-# --- Face detection deps ---
+# Face detection
 import cv2
 import numpy as np
 
@@ -70,6 +70,7 @@ def init_db():
             approval_status TEXT
         );
         """))
+        # Migrações leves (ignora se já existem)
         for alter in [
             "ALTER TABLE registrations ADD COLUMN first_name TEXT",
             "ALTER TABLE registrations ADD COLUMN last_name TEXT",
@@ -132,10 +133,7 @@ def save_image(file, reg_id: str, suffix: str, max_size=(800, 800)) -> str:
 # FACE DETECTION
 # =========================
 def count_faces_in_image(file) -> int:
-    """
-    Retorna o número de faces detectadas na imagem (UploadedFile/camera_input).
-    Usa Haar Cascade (rápido e leve).
-    """
+    """Retorna o número de faces detectadas na imagem (UploadedFile/camera_input)."""
     if file is None:
         return 0
     bytes_data = file.getvalue()
@@ -523,10 +521,12 @@ with st.form("registration_form", clear_on_submit=False):
 
     notes = st.text_area("Observações (opcional)", height=80, key="notes")
 
-    # >>> Botão de envio DENTRO do form <<<
+    # Botão de envio DENTRO do form
     submitted = st.form_submit_button("Enviar inscrição")
 
-# ======= VALIDAÇÃO E PROCESSAMENTO =======
+# =========================
+# PROCESSAMENTO DO SUBMIT
+# =========================
 if submitted:
     # Verifica obrigatórios
     errors = set()
@@ -586,6 +586,7 @@ if submitted:
         st.error("Data de nascimento inválida. Verifique dia, mês e ano.")
         st.stop()
 
+    # Idade por ano-base (categoria pelo ANO)
     age_years = compute_age_year_based(int(st.session_state["dob_year"]))
     age_div = age_division_by_year(age_years)
     category = age_div
