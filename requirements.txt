@@ -4,3 +4,5 @@ sqlalchemy
 pillow
 pycountry
 deep-translator
+opencv-python
+numpy
