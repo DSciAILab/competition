@@ -15,7 +15,7 @@ from PIL import Image
 # =========================
 st.set_page_config(page_title="Inscrição – ADSS Jiu-Jitsu Competition", layout="centered")
 
-# Secrets opcionais (apenas não quebre se não existir)
+# Secrets opcionais (não falhar se não existir)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", None)
 try:
     if "ADMIN_PASSWORD" in st.secrets:
@@ -65,7 +65,7 @@ def init_db():
             id_doc_photo_path TEXT
         );
         """))
-        # Tentar adicionar colunas novas se DB antigo existir (ignora erros)
+        # Migração leve (ignora erros se colunas já existirem)
         for alter in [
             "ALTER TABLE registrations ADD COLUMN first_name TEXT",
             "ALTER TABLE registrations ADD COLUMN last_name TEXT",
@@ -94,7 +94,9 @@ def fetch_all():
 def fetch_distinct_academies():
     with engine.begin() as conn:
         try:
-            rows = conn.execute(text("SELECT DISTINCT academy FROM registrations WHERE academy IS NOT NULL AND academy <> ''")).fetchall()
+            rows = conn.execute(text(
+                "SELECT DISTINCT academy FROM registrations WHERE academy IS NOT NULL AND academy <> ''"
+            )).fetchall()
             return sorted({r[0] for r in rows})
         except Exception:
             return []
@@ -102,13 +104,15 @@ def fetch_distinct_academies():
 def count_by_category(category_value: str):
     with engine.begin() as conn:
         try:
-            row = conn.execute(text("SELECT COUNT(*) FROM registrations WHERE category = :c"), {"c": category_value}).fetchone()
+            row = conn.execute(text(
+                "SELECT COUNT(*) FROM registrations WHERE category = :c"
+            ), {"c": category_value}).fetchone()
             return int(row[0] if row else 0)
         except Exception:
             return 0
 
 # =========================
-# UTIL: salvar imagem / arquivo
+# UTIL: salvar imagem
 # =========================
 def save_image(file, reg_id: str, suffix: str, max_size=(800, 800)) -> str:
     if file is None:
@@ -126,36 +130,33 @@ def squeeze_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 def title_capitalize(s: str) -> str:
-    # Coloca somente a primeira letra de cada palavra maiúscula
+    # Somente a primeira letra de cada palavra maiúscula
     return " ".join([w.capitalize() for w in squeeze_spaces(s).split(" ")])
 
 def normalize_academy(s: str) -> str:
     return title_capitalize(s)
 
 def clean_and_format_phone_05_mask(raw: str) -> str:
-    # Expectativa: 05_-___-____  (ex.: 052-123-4567)
+    # Máscara esperada: 05_-___-____ (ex.: 052-123-4567)
     digits = re.sub(r"\D", "", raw or "")
-    if digits.startswith("9715"):  # comum no UAE com DDI
+    if digits.startswith("9715"):  # ajuste comum com DDI EAU
         digits = "05" + digits[-8:]
     if digits.startswith("5") and len(digits) == 9:
         digits = "0" + digits
     if len(digits) == 10 and digits.startswith("05"):
         return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
-    # fallback: retorna original limpo, mas deixa o usuário corrigir
-    return raw
+    return raw  # fallback
 
-# Tradução para inglês (opcional, sem chave)
 def translate_to_english(text_in: str) -> str:
     try:
         from deep_translator import GoogleTranslator
         t = GoogleTranslator(source="auto", target="en").translate(text_in)
         return title_capitalize(t)
     except Exception:
-        # Se falhar, devolve normalizado em "title case"
         return title_capitalize(text_in)
 
 # =========================
-# LISTAS
+# LISTAS / OPÇÕES
 # =========================
 MODALIDADES = ["Gi", "No-Gi"]
 GENEROS = ["Masculino", "Feminino"]
@@ -172,21 +173,18 @@ def weight_options(modalidade: str, genero: str):
         return PESOS_ADULT_MASC_GI if genero == "Masculino" else PESOS_ADULT_FEM_GI
     return PESOS_NOGI
 
-# Países via pycountry
 def get_country_list():
     try:
         import pycountry
         countries = [c.name for c in pycountry.countries]
-        # Ajustes comuns
         extras = ["Hong Kong", "Macau", "Palestine", "Kosovo"]
         countries = sorted(set(countries + extras))
         return countries
     except Exception:
-        # fallback simples
         return ["United Arab Emirates", "Brazil", "Portugal", "United States", "United Kingdom", "Italy", "Spain", "France", "Netherlands"]
 
 # =========================
-# CATEGORIA POR IDADE (baseada no ANO)
+# CATEGORIA POR IDADE (base ANO)
 # =========================
 def compute_age_year_based(year: int) -> int:
     if not year:
@@ -195,7 +193,6 @@ def compute_age_year_based(year: int) -> int:
     return max(0, current_year - year)
 
 def age_division_by_year(age_year_based: int) -> str:
-    # ajuste conforme seu regulamento. Aqui, regra simples:
     if age_year_based <= 15:
         return "Kids"
     if 16 <= age_year_based <= 17:
@@ -214,7 +211,7 @@ def belts_for(modalidade: str):
     return FAIXAS_GI if modalidade == "Gi" else FAIXAS_NOGI
 
 # =========================
-# SIDEBAR (Evento / Admin / Branding)
+# SIDEBAR (Evento / Admin / Branding / Navegação)
 # =========================
 st.sidebar.header("Informações do Evento")
 event_name = st.sidebar.text_input("Nome do evento", value="ADSS Jiu-Jitsu Competition")
@@ -226,11 +223,16 @@ admin_pw = st.sidebar.text_input("Senha admin", type="password", placeholder="�
 is_admin = (admin_pw == ADMIN_PASSWORD)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Contato & Branding")
+st.sidebar.subheader("Contato e Branding")
 whatsapp_phone = st.sidebar.text_input("WhatsApp da organização (com DDI)", value="+9715xxxxxxxx")
 logo_file = st.sidebar.file_uploader("Logo/Banner do evento (PNG/JPG)", type=["png", "jpg", "jpeg"])
 
+st.sidebar.markdown("---")
+page = st.sidebar.radio("Página", ["Formulário", "Estatísticas"], index=0)
+
+# =========================
 # Botão flutuante WhatsApp
+# =========================
 def whatsapp_button(phone: str, event_name: str):
     if not phone.strip():
         return
@@ -262,7 +264,7 @@ def whatsapp_button(phone: str, event_name: str):
 whatsapp_button(whatsapp_phone, event_name)
 
 # =========================
-# MODO ADMIN
+# VIEWS
 # =========================
 def admin_view():
     st.title("Painel do Organizador")
@@ -270,7 +272,7 @@ def admin_view():
     st.write(f"Total de inscrições: {len(df)}")
 
     if df.empty:
-        st.info("Nenhuma inscrição encontrada.")
+        st.info("Ainda não há inscrições.")
         return
 
     for _, row in df.iterrows():
@@ -304,10 +306,55 @@ def admin_view():
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("Baixar CSV", data=csv, file_name="inscricoes.csv", mime="text/csv")
 
+def stats_view():
+    st.title("Estatísticas – Inscritos por Categoria")
+    df = fetch_all()
+    if df.empty:
+        st.info("Ainda não há inscrições.")
+        return
+
+    if "category" not in df.columns:
+        st.error("Não foi encontrada a coluna 'category' na base.")
+        return
+
+    totals = (
+        df.groupby("category", dropna=False)
+          .size()
+          .reset_index(name="inscritos")
+          .sort_values("inscritos", ascending=False)
+          .reset_index(drop=True)
+    )
+    st.subheader("Total por categoria")
+    st.dataframe(totals, use_container_width=True)
+    st.bar_chart(totals.set_index("category"))
+
+    st.subheader("Detalhamento por modalidade dentro de cada categoria")
+    if {"category", "modality"}.issubset(df.columns):
+        pivot_mod = (
+            df.pivot_table(index="category", columns="modality", values="id", aggfunc="count", fill_value=0)
+        )
+        st.dataframe(pivot_mod, use_container_width=True)
+
+    st.subheader("Detalhamento por faixa dentro de cada categoria")
+    if {"category", "belt"}.issubset(df.columns):
+        pivot_belt = (
+            df.pivot_table(index="category", columns="belt", values="id", aggfunc="count", fill_value=0)
+        )
+        st.dataframe(pivot_belt, use_container_width=True)
+
+# =========================
+# ROTEAMENTO
+# =========================
 if is_admin:
     if logo_file is not None:
         st.image(logo_file, use_container_width=True)
     admin_view()
+    st.stop()
+
+if page == "Estatísticas":
+    if logo_file is not None:
+        st.image(logo_file, use_container_width=True)
+    stats_view()
     st.stop()
 
 # =========================
@@ -335,7 +382,6 @@ with st.form("registration_form", clear_on_submit=True):
         nationality = st.selectbox("Nacionalidade*", get_country_list())
         gender = st.selectbox("Gênero*", GENEROS, index=0)
     with colB:
-        # Data de nascimento em 3 campos: dia/mes/ano
         st.write("Data de nascimento*")
         c1, c2, c3 = st.columns([1,1,2])
         with c1:
@@ -354,18 +400,15 @@ with st.form("registration_form", clear_on_submit=True):
         coach = st.text_input("Professor/Coach", placeholder="Nome do coach")
         coach_phone_input = st.text_input("Telefone do Professor (formato 05_-___-____)", placeholder="052-123-4567")
 
-    # Fotos obrigatórias
     st.subheader("Fotos obrigatórias")
     profile_img = st.camera_input("Foto de Perfil (rosto visível)")
     id_doc_img = st.camera_input("Documento de Identificação (frente)")
 
-    # Modalidade / Faixa / Peso
     st.subheader("Informações de Competição")
     modality = st.selectbox("Modalidade*", MODALIDADES, index=0)
     belt = st.selectbox("Faixa*", belts_for(modality))
     weight_class = st.selectbox("Peso*", weight_options(modality, gender))
 
-    # Termo de consentimento
     st.subheader("Termo de Consentimento")
     st.write("Declaro estar apto(a) a participar e concordo com as regras do evento.")
     consent = st.checkbox("Eu li e concordo com o termo de consentimento*")
@@ -375,7 +418,6 @@ with st.form("registration_form", clear_on_submit=True):
     submitted = st.form_submit_button("Enviar inscrição")
 
     if submitted:
-        # Validações básicas
         missing = []
         if not first_name_raw: missing.append("Nome")
         if not last_name_raw: missing.append("Sobrenome")
@@ -390,7 +432,6 @@ with st.form("registration_form", clear_on_submit=True):
         if missing:
             st.error("Por favor, preencha os campos obrigatórios: " + ", ".join(missing))
         else:
-            # Normalizações
             first_name = title_capitalize(first_name_raw)
             last_name  = title_capitalize(last_name_raw)
             full_name_en = translate_to_english(f"{first_name} {last_name}")
@@ -400,19 +441,15 @@ with st.form("registration_form", clear_on_submit=True):
 
             academy = normalize_academy(academy_other if academy_choice == "(Outro)" else academy_choice)
 
-            # Montar data de nascimento (validação simples)
             try:
                 dob_date = dt.date(int(dob_year), int(dob_month), int(dob_day))
                 dob_iso = dob_date.isoformat()
             except Exception:
-                st.error("Data de nascimento inválida. Verifique dia/mês/ano.")
+                st.error("Data de nascimento inválida. Verifique dia, mês e ano.")
                 st.stop()
 
-            # Idade baseada no ano (pedido do cliente)
             age_years = compute_age_year_based(int(dob_year))
             age_div = age_division_by_year(age_years)
-
-            # Categoria (faixa etária) = age_div
             category = age_div
 
             reg_id = str(uuid.uuid4())[:8].upper()
@@ -449,13 +486,11 @@ with st.form("registration_form", clear_on_submit=True):
 
             try:
                 insert_registration(row)
-                st.success(f"Inscrição enviada com sucesso! Seu ID: {reg_id}")
+                st.success(f"Inscrição enviada com sucesso. ID: {reg_id}")
 
-                # Mostrar contagem de atletas naquela categoria
                 total_cat = count_by_category(category)
                 st.info(f"Atletas já inscritos na categoria '{category}': {total_cat}")
 
-                # Link WhatsApp com ID
                 if whatsapp_phone.strip():
                     msg = f"Olá! Minha inscrição do evento {event_name} foi enviada. Meu ID é {reg_id}."
                     phone_clean = whatsapp_phone.replace("+", "").replace(" ", "").replace("-", "")
