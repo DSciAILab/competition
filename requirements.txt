@@ -2,3 +2,5 @@ streamlit
 pandas
 sqlalchemy
 pillow
+pycountry
+deep-translator
