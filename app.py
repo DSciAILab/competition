@@ -62,7 +62,8 @@ def init_db():
             consent INTEGER,
             notes TEXT,
             profile_photo_path TEXT,
-            id_doc_photo_path TEXT
+            id_doc_photo_path TEXT,
+            approval_status TEXT
         );
         """))
         # Migração leve (ignora erros se colunas já existirem)
@@ -71,7 +72,8 @@ def init_db():
             "ALTER TABLE registrations ADD COLUMN last_name TEXT",
             "ALTER TABLE registrations ADD COLUMN full_name_en TEXT",
             "ALTER TABLE registrations ADD COLUMN coach_phone TEXT",
-            "ALTER TABLE registrations ADD COLUMN age_years INTEGER"
+            "ALTER TABLE registrations ADD COLUMN age_years INTEGER",
+            "ALTER TABLE registrations ADD COLUMN approval_status TEXT"
         ]:
             try:
                 conn.execute(text(alter))
@@ -275,9 +277,31 @@ def admin_view():
         st.info("Ainda não há inscrições.")
         return
 
+    # Badge CSS simples
+    st.markdown("""
+        <style>
+        .badge-pending {
+            display:inline-block;
+            padding:2px 8px;
+            border-radius:999px;
+            background:#F59E0B; /* amarelo */
+            color:#111;
+            font-size:12px;
+            font-weight:600;
+            margin-left:8px;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
     for _, row in df.iterrows():
-        header = f"{row.get('first_name','')} {row.get('last_name','')} – {row.get('id','')}".strip()
-        with st.expander(header or row.get('id','(sem id)')):
+        name = f"{row.get('first_name','')} {row.get('last_name','')}".strip()
+        status = (row.get("approval_status") or "Pending").strip()
+        badge_html = ""
+        if status.lower() == "pending":
+            badge_html = "<span class='badge-pending'>Pendente de aprovação</span>"
+        header_html = (name or row.get('id','(sem id)')) + " " + badge_html
+
+        with st.expander(header_html, expanded=False):
             meta = {
                 "Nome (EN)": row.get("full_name_en",""),
                 "E-mail": row.get("email",""),
@@ -295,6 +319,7 @@ def admin_view():
                 "Faixa": row.get("belt",""),
                 "Peso": row.get("weight_class",""),
                 "Categoria": row.get("category",""),
+                "Status": status,
                 "Criado em (UTC)": row.get("created_at","")
             }
             st.write(meta)
@@ -482,11 +507,13 @@ with st.form("registration_form", clear_on_submit=True):
                 "notes": (notes or "").strip(),
                 "profile_photo_path": profile_photo_path,
                 "id_doc_photo_path": id_doc_photo_path,
+                "approval_status": "Pending"
             }
 
             try:
                 insert_registration(row)
                 st.success(f"Inscrição enviada com sucesso. ID: {reg_id}")
+                st.info("Status da sua inscrição: Pendente de aprovação.")
 
                 total_cat = count_by_category(category)
                 st.info(f"Atletas já inscritos na categoria '{category}': {total_cat}")
