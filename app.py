@@ -10,6 +10,10 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from PIL import Image
 
+# --- Face detection deps ---
+import cv2
+import numpy as np
+
 # =========================
 # CONFIG GERAL
 # =========================
@@ -66,7 +70,6 @@ def init_db():
             approval_status TEXT
         );
         """))
-        # Migração leve (ignora erros se colunas já existirem)
         for alter in [
             "ALTER TABLE registrations ADD COLUMN first_name TEXT",
             "ALTER TABLE registrations ADD COLUMN last_name TEXT",
@@ -126,6 +129,26 @@ def save_image(file, reg_id: str, suffix: str, max_size=(800, 800)) -> str:
     return str(dest)
 
 # =========================
+# FACE DETECTION
+# =========================
+def count_faces_in_image(file) -> int:
+    """
+    Retorna o número de faces detectadas na imagem (UploadedFile/camera_input).
+    Usa Haar Cascade (rápido e leve).
+    """
+    if file is None:
+        return 0
+    bytes_data = file.getvalue()
+    np_arr = np.frombuffer(bytes_data, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return 0
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+    return 0 if faces is None else len(faces)
+
+# =========================
 # NORMALIZAÇÃO / VALIDAÇÃO
 # =========================
 def squeeze_spaces(s: str) -> str:
@@ -139,16 +162,14 @@ def normalize_academy(s: str) -> str:
     return title_capitalize(s)
 
 def mask_and_validate_phone_live(key: str):
-    """Formata ao digitar para 05_-___-____ e limita a 10 dígitos (EAU)."""
+    """Formata ao digitar para 05_-___-____ e limita a 10 dígitos."""
     raw = st.session_state.get(key, "") or ""
     digits = re.sub(r"\D", "", raw)
-    # Normalizações comuns
-    if digits.startswith("9715"):  # com DDI
+    if digits.startswith("9715"):
         digits = "05" + digits[-8:]
     if digits.startswith("5") and len(digits) <= 9:
         digits = "0" + digits
-    digits = digits[:10]  # força máx. 10 dígitos
-    # Monta máscara dinâmica
+    digits = digits[:10]
     if len(digits) <= 3:
         out = digits
     elif len(digits) <= 6:
@@ -167,7 +188,7 @@ def clean_and_format_phone_final(raw: str) -> str:
     digits = digits[:10]
     if len(digits) == 10 and digits.startswith("05"):
         return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
-    return raw  # fallback
+    return raw
 
 def translate_to_english(text_in: str) -> str:
     try:
@@ -366,7 +387,6 @@ def stats_view():
     if df.empty:
         st.info("Ainda não há inscrições.")
         return
-
     if "category" not in df.columns:
         st.error("Não foi encontrada a coluna 'category' na base.")
         return
@@ -384,16 +404,12 @@ def stats_view():
 
     st.subheader("Detalhamento por modalidade dentro de cada categoria")
     if {"category", "modality"}.issubset(df.columns):
-        pivot_mod = (
-            df.pivot_table(index="category", columns="modality", values="id", aggfunc="count", fill_value=0)
-        )
+        pivot_mod = df.pivot_table(index="category", columns="modality", values="id", aggfunc="count", fill_value=0)
         st.dataframe(pivot_mod, use_container_width=True)
 
     st.subheader("Detalhamento por faixa dentro de cada categoria")
     if {"category", "belt"}.issubset(df.columns):
-        pivot_belt = (
-            df.pivot_table(index="category", columns="belt", values="id", aggfunc="count", fill_value=0)
-        )
+        pivot_belt = df.pivot_table(index="category", columns="belt", values="id", aggfunc="count", fill_value=0)
         st.dataframe(pivot_belt, use_container_width=True)
 
 # =========================
@@ -466,12 +482,10 @@ with st.form("registration_form", clear_on_submit=False):
             label("Ano", "dob_year", required=True)
             dob_year = st.number_input("", key="dob_year", label_visibility="collapsed", min_value=1900, max_value=current_year, step=1, value=st.session_state.get("dob_year", None))
 
-        # Academias cadastradas
         academies = fetch_distinct_academies()
         options = ["Selecione...", "Minha academia não está na lista"] + academies
         label("Academia", "academy_choice", required=True)
         academy_choice = st.selectbox("", options, key="academy_choice", label_visibility="collapsed", index=st.session_state.get("academy_choice_idx", 0))
-        # Se não estiver na lista, pede o nome
         academy_other = ""
         if academy_choice == "Minha academia não está na lista":
             label("Nome da academia", "academy_other", required=True)
@@ -509,108 +523,118 @@ with st.form("registration_form", clear_on_submit=False):
 
     notes = st.text_area("Observações (opcional)", height=80, key="notes")
 
+    # >>> Botão de envio DENTRO do form <<<
     submitted = st.form_submit_button("Enviar inscrição")
 
-    if submitted:
-        # Verifica obrigatórios
-        errors = set()
-        if not st.session_state.get("first_name"): errors.add("first_name")
-        if not st.session_state.get("last_name"):  errors.add("last_name")
-        if not st.session_state.get("email"):      errors.add("email")
-        if not st.session_state.get("phone"):      errors.add("phone")
-        if not st.session_state.get("gender"):     errors.add("gender")
-        if not st.session_state.get("nationality"):errors.add("nationality")
-        if not st.session_state.get("modality"):   errors.add("modality")
-        if not st.session_state.get("belt"):       errors.add("belt")
-        if not st.session_state.get("weight_class"): errors.add("weight_class")
-        if st.session_state.get("academy_choice") in (None, "", "Selecione..."): errors.add("academy_choice")
-        if st.session_state.get("academy_choice") == "Minha academia não está na lista" and not st.session_state.get("academy_other"):
-            errors.add("academy_other")
-        if st.session_state.get("dob_day") in (None, ""):   errors.add("dob_day")
-        if st.session_state.get("dob_month") in (None, ""): errors.add("dob_month")
-        if st.session_state.get("dob_year") in (None, ""):  errors.add("dob_year")
-        if st.session_state.get("profile_img") is None:     errors.add("profile_img")
-        if st.session_state.get("id_doc_img") is None:      errors.add("id_doc_img")
-        if not st.session_state.get("consent"):             errors.add("consent")
+# ======= VALIDAÇÃO E PROCESSAMENTO =======
+if submitted:
+    # Verifica obrigatórios
+    errors = set()
+    if not st.session_state.get("first_name"): errors.add("first_name")
+    if not st.session_state.get("last_name"):  errors.add("last_name")
+    if not st.session_state.get("email"):      errors.add("email")
+    if not st.session_state.get("phone"):      errors.add("phone")
+    if not st.session_state.get("gender"):     errors.add("gender")
+    if not st.session_state.get("nationality"):errors.add("nationality")
+    if not st.session_state.get("modality"):   errors.add("modality")
+    if not st.session_state.get("belt"):       errors.add("belt")
+    if not st.session_state.get("weight_class"): errors.add("weight_class")
+    if st.session_state.get("academy_choice") in (None, "", "Selecione..."): errors.add("academy_choice")
+    if st.session_state.get("academy_choice") == "Minha academia não está na lista" and not st.session_state.get("academy_other"):
+        errors.add("academy_other")
+    if st.session_state.get("dob_day") in (None, ""):   errors.add("dob_day")
+    if st.session_state.get("dob_month") in (None, ""): errors.add("dob_month")
+    if st.session_state.get("dob_year") in (None, ""):  errors.add("dob_year")
+    if st.session_state.get("profile_img") is None:     errors.add("profile_img")
+    if st.session_state.get("id_doc_img") is None:      errors.add("id_doc_img")
+    if not st.session_state.get("consent"):             errors.add("consent")
 
-        st.session_state["errors"] = errors  # para destacar em vermelho
+    # Validação de rosto na foto de perfil
+    if "profile_img" not in errors and st.session_state.get("profile_img") is not None:
+        faces_profile = count_faces_in_image(st.session_state.get("profile_img"))
+        if faces_profile == 0:
+            errors.add("profile_img")
+            st.error("A foto de perfil não parece conter um rosto. Por favor, envie uma foto clara do rosto.")
+        elif faces_profile > 1:
+            errors.add("profile_img")
+            st.error("Detectamos mais de uma pessoa na foto de perfil. Envie uma foto só do atleta.")
 
-        if errors:
-            st.error("Há campos obrigatórios faltando. Eles estão destacados em vermelho acima.")
-            st.stop()
+    st.session_state["errors"] = errors  # para destacar em vermelho
 
-        # Normalizações
-        first_name = title_capitalize(st.session_state["first_name"])
-        last_name  = title_capitalize(st.session_state["last_name"])
-        full_name_en = translate_to_english(f"{first_name} {last_name}")
+    if errors:
+        st.error("Há campos obrigatórios faltando. Eles estão destacados em vermelho acima.")
+        st.stop()
 
-        phone = clean_and_format_phone_final(st.session_state["phone"])
-        coach_phone = clean_and_format_phone_final(st.session_state.get("coach_phone","")) if st.session_state.get("coach_phone") else ""
+    # Normalizações
+    first_name = title_capitalize(st.session_state["first_name"])
+    last_name  = title_capitalize(st.session_state["last_name"])
+    full_name_en = translate_to_english(f"{first_name} {last_name}")
 
-        # Academia
-        if st.session_state["academy_choice"] == "Minha academia não está na lista":
-            academy = normalize_academy(st.session_state["academy_other"])
-        else:
-            academy = normalize_academy(st.session_state["academy_choice"])
+    phone = clean_and_format_phone_final(st.session_state["phone"])
+    coach_phone = clean_and_format_phone_final(st.session_state.get("coach_phone","")) if st.session_state.get("coach_phone") else ""
 
-        # Data
-        try:
-            dob_date = dt.date(int(st.session_state["dob_year"]), int(st.session_state["dob_month"]), int(st.session_state["dob_day"]))
-            dob_iso = dob_date.isoformat()
-        except Exception:
-            st.error("Data de nascimento inválida. Verifique dia, mês e ano.")
-            st.stop()
+    if st.session_state["academy_choice"] == "Minha academia não está na lista":
+        academy = normalize_academy(st.session_state["academy_other"])
+    else:
+        academy = normalize_academy(st.session_state["academy_choice"])
 
-        # Idade por ano-base
-        age_years = compute_age_year_based(int(st.session_state["dob_year"]))
-        age_div = age_division_by_year(age_years)
-        category = age_div
+    # Data
+    try:
+        dob_date = dt.date(int(st.session_state["dob_year"]), int(st.session_state["dob_month"]), int(st.session_state["dob_day"]))
+        dob_iso = dob_date.isoformat()
+    except Exception:
+        st.error("Data de nascimento inválida. Verifique dia, mês e ano.")
+        st.stop()
 
-        reg_id = str(uuid.uuid4())[:8].upper()
-        profile_photo_path = save_image(st.session_state["profile_img"], reg_id, "profile")
-        id_doc_photo_path = save_image(st.session_state["id_doc_img"], reg_id, "id_doc")
+    age_years = compute_age_year_based(int(st.session_state["dob_year"]))
+    age_div = age_division_by_year(age_years)
+    category = age_div
 
-        row = {
-            "id": reg_id,
-            "created_at": dt.datetime.utcnow().isoformat(),
-            "event_name": event_name,
-            "first_name": first_name,
-            "last_name": last_name,
-            "full_name_en": full_name_en,
-            "email": st.session_state["email"].strip(),
-            "phone": phone,
-            "nationality": st.session_state["nationality"],
-            "gender": st.session_state["gender"],
-            "dob": dob_iso,
-            "age_years": age_years,
-            "age_division": age_div,
-            "academy": academy,
-            "coach": title_capitalize(st.session_state.get("coach","")),
-            "coach_phone": coach_phone,
-            "region": region,
-            "modality": st.session_state["modality"],
-            "belt": st.session_state["belt"],
-            "weight_class": st.session_state["weight_class"],
-            "category": category,
-            "consent": 1,
-            "notes": (st.session_state.get("notes") or "").strip(),
-            "profile_photo_path": profile_photo_path,
-            "id_doc_photo_path": id_doc_photo_path,
-            "approval_status": "Pending"
-        }
+    reg_id = str(uuid.uuid4())[:8].upper()
+    profile_photo_path = save_image(st.session_state["profile_img"], reg_id, "profile")
+    id_doc_photo_path = save_image(st.session_state["id_doc_img"], reg_id, "id_doc")
 
-        try:
-            insert_registration(row)
-            st.success(f"Inscrição enviada com sucesso. ID: {reg_id}")
-            st.info("Status da sua inscrição: Pendente de aprovação.")
+    row = {
+        "id": reg_id,
+        "created_at": dt.datetime.utcnow().isoformat(),
+        "event_name": event_name,
+        "first_name": first_name,
+        "last_name": last_name,
+        "full_name_en": full_name_en,
+        "email": st.session_state["email"].strip(),
+        "phone": phone,
+        "nationality": st.session_state["nationality"],
+        "gender": st.session_state["gender"],
+        "dob": dob_iso,
+        "age_years": age_years,
+        "age_division": age_div,
+        "academy": academy,
+        "coach": title_capitalize(st.session_state.get("coach","")),
+        "coach_phone": coach_phone,
+        "region": region,
+        "modality": st.session_state["modality"],
+        "belt": st.session_state["belt"],
+        "weight_class": st.session_state["weight_class"],
+        "category": category,
+        "consent": 1,
+        "notes": (st.session_state.get("notes") or "").strip(),
+        "profile_photo_path": profile_photo_path,
+        "id_doc_photo_path": id_doc_photo_path,
+        "approval_status": "Pending"
+    }
 
-            total_cat = count_by_category(category)
-            st.info(f"Atletas já inscritos na categoria '{category}': {total_cat}")
+    try:
+        insert_registration(row)
+        st.success(f"Inscrição enviada com sucesso. ID: {reg_id}")
+        st.info("Status da sua inscrição: Pendente de aprovação.")
 
-            if whatsapp_phone.strip():
-                msg = f"Olá! Minha inscrição do evento {event_name} foi enviada. Meu ID é {reg_id}."
-                phone_clean = whatsapp_phone.replace("+", "").replace(" ", "").replace("-", "")
-                wa_url = f"https://wa.me/{phone_clean}?text=" + urllib.parse.quote(msg)
-                st.markdown(f"[Falar com a organização no WhatsApp]({wa_url})")
-        except Exception as e:
-            st.error(f"Erro ao salvar inscrição: {e}")
+        total_cat = count_by_category(category)
+        st.info(f"Atletas já inscritos na categoria '{category}': {total_cat}")
+
+        if whatsapp_phone.strip():
+            msg = f"Olá! Minha inscrição do evento {event_name} foi enviada. Meu ID é {reg_id}."
+            phone_clean = whatsapp_phone.replace("+", "").replace(" ", "").replace("-", "")
+            wa_url = f"https://wa.me/{phone_clean}?text=" + urllib.parse.quote(msg)
+            st.markdown(f"[Falar com a organização no WhatsApp]({wa_url})")
+    except Exception as e:
+        st.error(f"Erro ao salvar inscrição: {e}")
