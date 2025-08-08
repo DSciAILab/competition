@@ -10,9 +10,14 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from PIL import Image
 
-# Face detection
-import cv2
+# Face detection (compatível com cloud)
 import numpy as np
+try:
+    import cv2
+    FACE_DETECT_AVAILABLE = True
+except Exception:
+    cv2 = None
+    FACE_DETECT_AVAILABLE = False
 
 # =========================
 # CONFIG GERAL
@@ -133,7 +138,12 @@ def save_image(file, reg_id: str, suffix: str, max_size=(800, 800)) -> str:
 # FACE DETECTION
 # =========================
 def count_faces_in_image(file) -> int:
-    """Retorna o número de faces detectadas na imagem (UploadedFile/camera_input)."""
+    """
+    Retorna o número de faces detectadas.
+    - Se OpenCV não estiver disponível, retorna -1 (sem validação).
+    """
+    if not FACE_DETECT_AVAILABLE:
+        return -1
     if file is None:
         return 0
     bytes_data = file.getvalue()
@@ -549,15 +559,18 @@ if submitted:
     if st.session_state.get("id_doc_img") is None:      errors.add("id_doc_img")
     if not st.session_state.get("consent"):             errors.add("consent")
 
-    # Validação de rosto na foto de perfil
+    # Validação de rosto na foto de perfil (tolerante em cloud)
     if "profile_img" not in errors and st.session_state.get("profile_img") is not None:
         faces_profile = count_faces_in_image(st.session_state.get("profile_img"))
-        if faces_profile == 0:
-            errors.add("profile_img")
-            st.error("A foto de perfil não parece conter um rosto. Por favor, envie uma foto clara do rosto.")
-        elif faces_profile > 1:
-            errors.add("profile_img")
-            st.error("Detectamos mais de uma pessoa na foto de perfil. Envie uma foto só do atleta.")
+        if faces_profile == -1:
+            st.warning("Validação automática de rosto indisponível no ambiente atual. Prosseguindo sem essa checagem.")
+        else:
+            if faces_profile == 0:
+                errors.add("profile_img")
+                st.error("A foto de perfil não parece conter um rosto. Por favor, envie uma foto clara do rosto.")
+            elif faces_profile > 1:
+                errors.add("profile_img")
+                st.error("Detectamos mais de uma pessoa na foto de perfil. Envie uma foto só do atleta.")
 
     st.session_state["errors"] = errors  # para destacar em vermelho
 
