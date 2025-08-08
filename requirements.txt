@@ -6,4 +6,5 @@ pycountry
 deep-translator
 opencv-python-headless
 numpy
- 
+ImageHash
+
