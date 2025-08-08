@@ -169,9 +169,10 @@ def title_capitalize(s: str) -> str:
 def normalize_academy(s: str) -> str:
     return title_capitalize(s)
 
-def mask_and_validate_phone_live(key: str):
-    """Formata ao digitar para 05_-___-____ e limita a 10 dígitos."""
-    raw = st.session_state.get(key, "") or ""
+# (sem callbacks dentro do form)
+def format_phone_live(raw: str) -> str:
+    """Formata para 05_-___-____ sem usar on_change (compatível com st.form)."""
+    raw = raw or ""
     digits = re.sub(r"\D", "", raw)
     if digits.startswith("9715"):
         digits = "05" + digits[-8:]
@@ -179,12 +180,11 @@ def mask_and_validate_phone_live(key: str):
         digits = "0" + digits
     digits = digits[:10]
     if len(digits) <= 3:
-        out = digits
+        return digits
     elif len(digits) <= 6:
-        out = f"{digits[:3]}-{digits[3:]}"
+        return f"{digits[:3]}-{digits[3:]}"
     else:
-        out = f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
-    st.session_state[key] = out
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
 
 def clean_and_format_phone_final(raw: str) -> str:
     """Valida e normaliza no submit (mantém 052-123-4567)."""
@@ -445,6 +445,14 @@ else:
     st.markdown(f"<p style='text-align:center;margin-top:4px;color:#777'>{region}</p>", unsafe_allow_html=True)
 
 # =========================
+# PRÉ-MÁSCARA (sem callbacks) PARA CAMPOS DE TELEFONE
+# =========================
+if "phone" in st.session_state:
+    st.session_state["phone"] = format_phone_live(st.session_state["phone"])
+if "coach_phone" in st.session_state:
+    st.session_state["coach_phone"] = format_phone_live(st.session_state["coach_phone"])
+
+# =========================
 # FORMULÁRIO
 # =========================
 st.title("Formulário de Inscrição")
@@ -464,10 +472,7 @@ with st.form("registration_form", clear_on_submit=False):
         email = st.text_input("", key="email", label_visibility="collapsed", placeholder="email@exemplo.com")
 
         label("Telefone/WhatsApp (formato 05_-___-____)", "phone", required=True)
-        phone_input = st.text_input(
-            "", key="phone", label_visibility="collapsed",
-            placeholder="052-123-4567", on_change=mask_and_validate_phone_live, args=("phone",)
-        )
+        phone_input = st.text_input("", key="phone", label_visibility="collapsed", placeholder="052-123-4567")
 
         label("Nacionalidade", "nationality", required=True)
         nationality = st.selectbox("", get_country_list(), key="nationality", label_visibility="collapsed")
@@ -503,10 +508,7 @@ with st.form("registration_form", clear_on_submit=False):
         coach = st.text_input("", key="coach", label_visibility="collapsed", placeholder="Nome do coach")
 
         label("Telefone do Professor (formato 05_-___-____)", "coach_phone", required=False)
-        coach_phone_input = st.text_input(
-            "", key="coach_phone", label_visibility="collapsed",
-            placeholder="052-123-4567", on_change=mask_and_validate_phone_live, args=("coach_phone",)
-        )
+        coach_phone_input = st.text_input("", key="coach_phone", label_visibility="collapsed", placeholder="052-123-4567")
 
     st.subheader("Fotos obrigatórias")
     label("Foto de Perfil (rosto visível)", "profile_img", required=True)
@@ -583,6 +585,7 @@ if submitted:
     last_name  = title_capitalize(st.session_state["last_name"])
     full_name_en = translate_to_english(f"{first_name} {last_name}")
 
+    # Aplica formatação final de telefone no submit
     phone = clean_and_format_phone_final(st.session_state["phone"])
     coach_phone = clean_and_format_phone_final(st.session_state.get("coach_phone","")) if st.session_state.get("coach_phone") else ""
 
