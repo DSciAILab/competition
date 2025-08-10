@@ -1,12 +1,11 @@
 # ================================
-# app.py – ADSS Jiu-Jitsu Competition (Versão Complexa c/ Patch OCR)
-# Mobile-first + máscaras live + OCR de EID (Google Vision opcional) + fallback local
-# Patch: aplica dados de OCR via buffers no início da tela e usa st.rerun()
-# Divisão preview, responsável de menor, peso atual, carteirinha JPG, Face ID, Admin
+# app.py – ADSS Jiu-Jitsu Competition
+# WebRTC autofocus + OCR EID opcional + Documento por foto ou upload (jpg/png/heic/pdf)
+# Lista pública agrupada + carteirinha JPG + Face ID por pHash + Admin
 # ================================
 
 # ---------- IMPORTS ----------
-import os, re, uuid, urllib.parse, base64, json, math, datetime as dt
+import os, re, uuid, urllib.parse, base64, datetime as dt
 from pathlib import Path
 from io import BytesIO
 
@@ -25,6 +24,13 @@ except Exception:
 
 import imagehash
 
+# streamlit-webrtc (opcional com fallback)
+WEBRTC_AVAILABLE = True
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase
+except Exception:
+    WEBRTC_AVAILABLE = False
+
 # ====== OCR (Google Vision) opcional ======
 USE_VISION_OCR = False
 try:
@@ -38,47 +44,37 @@ if not USE_VISION_OCR:
 if USE_VISION_OCR:
     try:
         from google.cloud import vision
-        # Se o JSON da credencial vier embutido (base64) nos secrets:
         if "GCP_CREDS_B64" in st.secrets:
             creds_b64 = st.secrets["GCP_CREDS_B64"]
-            creds_json = base64.b64decode(creds_b64.encode()).decode()
             cred_path = "gcp_creds.json"
-            with open(cred_path, "w") as f: f.write(creds_json)
+            with open(cred_path, "w") as f:
+                f.write(base64.b64decode(creds_b64.encode()).decode())
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
-        # Ou use GOOGLE_APPLICATION_CREDENTIALS já configurado no ambiente
         vision_client = vision.ImageAnnotatorClient()
     except Exception as e:
         USE_VISION_OCR = False
         st.warning(f"OCR via Google Vision não pôde ser inicializado: {e}. Usando fallback local.")
 
 # ================================
-# 1) CONFIG GLOBAL (FULL SCREEN + MOBILE)
+# 1) CONFIG GLOBAL
 # ================================
 st.set_page_config(page_title="ADSS Jiu-Jitsu Competition", layout="wide")
-
 st.markdown("""
 <style>
 #MainMenu, header, footer { visibility: hidden; }
 .block-container { padding-top: .6rem; padding-bottom: 3rem; max-width: 860px; }
-
-/* Botões grandes do menu (2 linhas via \\n) */
-.stButton > button {
-  width: 100%; padding: 1rem 1.1rem; border-radius: 14px;
-  font-weight: 700; text-align: left; white-space: pre-wrap; line-height: 1.25;
-}
-
-/* Inputs altos para toque */
+.stButton > button { width: 100%; padding: 1rem 1.1rem; border-radius: 14px; font-weight: 700; text-align: left; white-space: pre-wrap; line-height: 1.25; }
 .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] { min-height: 44px; }
-
-/* Câmera full-width */
-[data-testid="stCameraInput"] video, [data-testid="stCameraInput"] img { width: 100% !important; height: auto !important; }
-
 [data-testid="stDataFrame"] { border-radius: 12px; }
 .header-sub { color:#9aa0a6; margin:.25rem 0 1rem; text-align:center; }
 .section-gap { height: .6rem; }
 .badge-pending{display:inline-block;padding:2px 8px;border-radius:999px;background:#F59E0B;color:#111;font-size:12px;font-weight:600;margin-left:8px;}
-.small-muted {font-size:.9rem; color:#9aa0a6;}
+.badge-approved{display:inline-block;padding:2px 8px;border-radius:999px;background:#10B981;color:#111;font-size:12px;font-weight:600;margin-left:8px;}
 .preview-box { border:1px solid #2a2a2a; border-radius:12px; padding:12px; background:#0f1116; }
+.card { border:1px solid #2b2b2b; border-radius:12px; padding:12px; margin-bottom:10px; display:flex; gap:12px; align-items:flex-start; }
+.card img { border-radius:8px; }
+.card .meta { font-size:0.95rem; line-height:1.3; }
+.group-title { margin-top:18px; padding:8px 10px; background:#0f1116; border:1px solid #2b2b2b; border-radius:10px; font-weight:700; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -91,9 +87,7 @@ try:
         ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 except Exception:
     pass
-if not ADMIN_PASSWORD:
-    ADMIN_PASSWORD = "admin123"
-
+if not ADMIN_PASSWORD: ADMIN_PASSWORD = "admin123"
 WHATSAPP_PHONE = os.getenv("WHATSAPP_ORG", "+9715xxxxxxxx")
 
 DB_PATH = "registrations.db"
@@ -129,10 +123,10 @@ def init_db():
             coach TEXT,
             coach_phone TEXT,
             region TEXT,
-            modality TEXT,        -- legado (não usado)
+            modality TEXT,
             belt TEXT,
-            weight_class TEXT,    -- legado (não usado)
-            weight_kg REAL,       -- peso atual do atleta
+            weight_class TEXT,
+            weight_kg REAL,
             category TEXT,
             consent INTEGER,
             profile_photo_path TEXT,
@@ -196,51 +190,56 @@ def count_by_category(category_value: str):
             return 0
 
 # ================================
-# 4) UTIL – PIL helpers (textbbox compat)
+# 4) PIL helper (textbbox compat)
 # ================================
 def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont):
-    """Compatível com Pillow moderno: usa textbbox para medir."""
     bbox = draw.textbbox((0,0), text, font=font)
     return (bbox[2]-bbox[0], bbox[3]-bbox[1])
 
 # ================================
 # 5) IMAGEM / FACE / PHASH / CARDS
 # ================================
-def save_image(file, reg_id: str, suffix: str, max_size=(800, 800)) -> str:
-    if file is None: return ""
-    image = Image.open(file); image.thumbnail(max_size)
+def _file_to_pil(file_or_pil):
+    if file_or_pil is None: return None
+    if isinstance(file_or_pil, Image.Image): return file_or_pil
+    try:
+        return Image.open(BytesIO(file_or_pil.getvalue())).convert("RGB")
+    except Exception:
+        try:
+            return Image.open(file_or_pil).convert("RGB")
+        except Exception:
+            return None
+
+def save_image(file_or_pil, reg_id: str, suffix: str, max_size=(800, 800)) -> str:
+    img = _file_to_pil(file_or_pil)
+    if img is None: return ""
+    img.thumbnail(max_size)
     dest = UPLOAD_DIR / f"{reg_id}_{suffix}.jpg"
-    image.save(dest, format="JPEG", quality=85)
+    img.save(dest, format="JPEG", quality=85)
     return str(dest)
 
-def count_faces_in_image(file) -> int:
+def count_faces_in_image(file_or_pil) -> int:
     if not FACE_DETECT_AVAILABLE: return -1
-    if file is None: return 0
-    data = file.getvalue()
-    arr = np.frombuffer(data, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    img = _file_to_pil(file_or_pil)
     if img is None: return 0
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     faces = cascade.detectMultiScale(gray, 1.1, 5, minSize=(80,80))
     return 0 if faces is None else len(faces)
 
-def crop_face_from_uploaded(file):
-    if file is None: return None
-    data = file.getvalue()
-    img_pil = Image.open(BytesIO(data)).convert("RGB")
+def crop_face_from_uploaded(file_or_pil):
+    img = _file_to_pil(file_or_pil)
+    if img is None: return None
     if FACE_DETECT_AVAILABLE:
-        arr = np.frombuffer(data, np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-            faces = cascade.detectMultiScale(gray, 1.1, 5, minSize=(80,80))
-            if faces is not None and len(faces)>0:
-                x,y,w,h = max(faces, key=lambda r:r[2]*r[3])
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_pil = Image.fromarray(rgb).crop((x,y,x+w,y+h))
-    return img_pil
+        arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        faces = cascade.detectMultiScale(gray, 1.1, 5, minSize=(80,80))
+        if faces is not None and len(faces)>0:
+            x,y,w,h = max(faces, key=lambda r:r[2]*r[3])
+            return img.crop((x,y,x+w,y+h))
+    return img
 
 def compute_phash(img_pil: Image.Image) -> str:
     if img_pil is None: return ""
@@ -250,7 +249,6 @@ def phash_distance(a: str, b: str) -> int:
     if not a or not b: return 1_000_000
     return imagehash.hex_to_hash(a) - imagehash.hex_to_hash(b)
 
-# ---- Cartão de inscrição (usa textbbox) ----
 def generate_registration_jpg(row: dict, event_name: str, region: str, logo_file=None, width=1080, height=1350) -> bytes:
     img = Image.new("RGB", (width, height), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
@@ -278,7 +276,6 @@ def generate_registration_jpg(row: dict, event_name: str, region: str, logo_file
     if region:
         w_reg, _ = text_size(draw, region, font_sub)
         draw.text(((width - w_reg) / 2, y), region, fill=(80, 80, 80), font=font_sub); y += 50
-
     draw.line([(80, y), (width - 80, y)], fill=(230,230,230), width=3); y += 30
 
     x_left = 80; photo_size = 320
@@ -329,7 +326,6 @@ def generate_registration_jpg(row: dict, event_name: str, region: str, logo_file
 
     buf = BytesIO(); img.save(buf, format="JPEG", quality=90, optimize=True); return buf.getvalue()
 
-# ---- Carteirinha (membership) ----
 def generate_membership_card(img_profile_path: str, membership_id: str, eid: str, age: int, name: str, belt: str, width=900, height=600) -> bytes:
     canvas = Image.new("RGB", (width, height), color=(245, 245, 245))
     draw = ImageDraw.Draw(canvas)
@@ -378,7 +374,6 @@ def squeeze_spaces(s:str)->str: return re.sub(r"\s+", " ", s or "").strip()
 def title_capitalize(s:str)->str: return " ".join([w.capitalize() for w in squeeze_spaces(s).split(" ")])
 def normalize_academy(s:str)->str: return title_capitalize(s)
 
-# Telefone (05_-___-____)
 def format_phone_live(raw: str) -> str:
     raw = raw or ""; digits = re.sub(r"\D", "", raw)
     if digits.startswith("9715"): digits = "05" + digits[-8:]
@@ -396,7 +391,6 @@ def clean_and_format_phone_final(raw: str) -> str:
     if len(digits) == 10 and digits.startswith("05"): return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
     return raw
 
-# EID (784-####-#######-#)
 def eid_format_live(raw: str) -> str:
     digits = re.sub(r"\D", "", raw or "")[:15]
     if not digits.startswith("784"):
@@ -414,7 +408,6 @@ def eid_format_live(raw: str) -> str:
 def eid_is_valid(masked: str) -> bool:
     return re.fullmatch(r"784-\d{4}-\d{7}-\d", masked or "") is not None
 
-# Data (dd/mm/aaaa)
 def date_mask_live(raw: str) -> str:
     d = re.sub(r"\D", "", raw or "")[:8]
     if len(d) <= 2: return d
@@ -430,7 +423,6 @@ def parse_masked_date(masked: str):
     except Exception:
         return None
 
-# Opções
 FAIXAS_GI = ["Branca","Cinza (Kids)","Amarela (Kids)","Laranja (Kids)","Verde (Kids)","Azul","Roxa","Marrom","Preta"]
 
 def get_country_list():
@@ -455,6 +447,16 @@ def age_division_by_year(age:int)->str:
     if 41<=age<=45: return "Master 3"
     return "Master 4+"
 
+def weight_division(weight_kg: float) -> str:
+    if not isinstance(weight_kg, (int, float)) or weight_kg <= 0:
+        return "N/D"
+    start = int(weight_kg // 5) * 5
+    lo = start
+    hi = start + 4.9
+    if lo < 20: lo = 20; hi = 24.9
+    if hi >= 125: return "125+ kg"
+    return f"{lo:.0f}–{hi:.1f} kg"
+
 # ================================
 # 7) OCR / VERIFICAÇÃO EID
 # ================================
@@ -465,66 +467,49 @@ DATE_REGEXES = [
 ]
 NATIONALITY_KEYS = ["nationality", "country", "citizenship"]
 NAME_KEYS = ["name", "cardholder", "card holder", "full name", "nome", "الاسم"]
-
 KEYWORDS_EID = ["emirates id", "united arab emirates", "identity", "authority", "emirates", "الهوية", "الإمارات"]
 
-def to_text_lines(s: str):
-    return [l.strip() for l in s.splitlines() if l.strip()]
+def to_text_lines(s: str): return [l.strip() for l in (s or "").splitlines() if l.strip()]
 
 def google_vision_ocr_extract(image_bytes: bytes) -> dict:
-    """Usa Vision para retornar {text, eid, dob, nationality, name, confidence, keywords_found}"""
     out = {"text": "", "eid": "", "dob": "", "nationality": "", "name": "", "confidence": 0.0, "keywords_found": []}
-    if not USE_VISION_OCR:
-        return out
+    if not USE_VISION_OCR: return out
     try:
         image = vision.Image(content=image_bytes)
         resp = vision_client.document_text_detection(image=image)
-        if resp.error.message:
-            return out
+        if resp.error.message: return out
         full_text = resp.full_text_annotation.text or ""
         out["text"] = full_text
         text_lower = full_text.lower()
         out["keywords_found"] = [kw for kw in KEYWORDS_EID if kw in text_lower]
-
-        # EID
-        m = EID_REGEX.search(full_text.replace(" ", ""))
-        if m: out["eid"] = m.group(0)
-
-        # Data de nascimento
+        m = EID_REGEX.search(full_text.replace(" ", ""));  out["eid"] = m.group(0) if m else ""
         for rx in DATE_REGEXES:
             m = rx.search(full_text)
             if m:
                 try:
-                    if rx.pattern.startswith(r"\b(\d{2})/"):  # dd/mm/yyyy
+                    if rx.pattern.startswith(r"\b(\d{2})/"):
                         d,mn,y = map(int, m.groups())
-                    else:  # yyyy-mm-dd
+                    else:
                         y,mn,d = map(int, m.groups())
-                    dob = dt.date(y,mn,d)
+                    _ = dt.date(y,mn,d)
                     out["dob"] = f"{d:02d}/{mn:02d}/{y:04d}"
                     break
                 except Exception:
                     pass
-
-        # Nacionalidade
         lines = to_text_lines(full_text)
         for li in lines:
             low = li.lower()
             if any(k in low for k in NATIONALITY_KEYS):
-                parts = re.split(r"[:\-]", li, maxsplit=1)
+                parts = re.split(r"[:\-]", li, 1)
                 cand = parts[1].strip() if len(parts) > 1 else li
-                out["nationality"] = squeeze_spaces(re.sub(r"(?i)nationality", "", cand)).strip()
-                break
-        # Nome
+                out["nationality"] = squeeze_spaces(re.sub(r"(?i)nationality", "", cand)).strip(); break
         for li in lines:
             low = li.lower()
             if any(k in low for k in NAME_KEYS):
-                parts = re.split(r"[:\-]", li, maxsplit=1)
+                parts = re.split(r"[:\-]", li, 1)
                 cand = parts[1].strip() if len(parts) > 1 else li
                 cand = re.sub(r"(?i)name|cardholder|card holder|full name|nome|الاسم", "", cand).strip()
-                out["name"] = squeeze_spaces(cand)
-                break
-
-        # confiança simples (heurística): 0-1
+                out["name"] = squeeze_spaces(cand); break
         score = 0.0
         if out["eid"]: score += 0.4
         if out["dob"]: score += 0.2
@@ -537,42 +522,87 @@ def google_vision_ocr_extract(image_bytes: bytes) -> dict:
         return out
 
 def local_heuristic_extract(image_bytes: bytes) -> dict:
-    """Fallback local: mantém leve; sem OCR adicional (pode plugar easyocr aqui se quiser)."""
-    out = {"text": "", "eid": "", "dob": "", "nationality": "", "name": "", "confidence": 0.0, "keywords_found": []}
-    return out
+    return {"text":"", "eid":"", "dob":"", "nationality":"", "name":"", "confidence":0.0, "keywords_found":[]}
 
 def is_likely_eid_card(image_bytes: bytes, ocr_text: str) -> (bool, float, dict):
-    """Combina proporção + regex + keywords para classificar imagem como EID."""
     details = {}
     try:
         img = Image.open(BytesIO(image_bytes))
-        w, h = img.size
-        ratio = w / h if h else 0
+        w, h = img.size; ratio = w / h if h else 0
         details["ratio"] = ratio
-        ratio_ok = 1.427 <= ratio <= 1.745   # ~1.586 ± ~10%
+        ratio_ok = 1.427 <= ratio <= 1.745
     except Exception:
         ratio_ok = False
-
     ocr_low = (ocr_text or "").lower()
     eid_found = bool(EID_REGEX.search((ocr_text or "").replace(" ", "")))
     kw_found = any(kw in ocr_low for kw in KEYWORDS_EID)
-
-    score = 0.0
-    if ratio_ok: score += 0.3
-    if eid_found: score += 0.5
-    if kw_found: score += 0.2
+    score = (0.3 if ratio_ok else 0.0) + (0.5 if eid_found else 0.0) + (0.2 if kw_found else 0.0)
     return (score >= 0.6), score, details
 
-def extract_eid_fields_from_image(uploaded_file, for_guardian=False):
-    """Pipeline: lê imagem, roda OCR (Vision se ativo, senão fallback), valida EID e retorna dict com campos."""
-    if uploaded_file is None:
-        return {"ok": False, "reason": "Sem imagem.", "data": {}}
+# ---------- NOVOS HELPERS p/ UPLOAD (jpg/png/heic/pdf) ----------
+def is_pdf_file(uploaded):
+    try:
+        return str(uploaded.name).lower().endswith(".pdf")
+    except Exception:
+        return False
 
-    img_bytes = uploaded_file.getvalue()
+def is_heic_file(uploaded):
+    try:
+        return str(uploaded.name).lower().endswith((".heic", ".heif"))
+    except Exception:
+        return False
+
+def convert_pdf_first_page_to_pil(uploaded):
+    try:
+        data = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+        from pdf2image import convert_from_bytes
+        pages = convert_from_bytes(data, first_page=1, last_page=1, fmt="jpeg")
+        return pages[0] if pages else None
+    except Exception:
+        return None
+
+def load_any_image_for_ocr(uploaded_or_pil):
+    if isinstance(uploaded_or_pil, Image.Image):
+        return uploaded_or_pil
+    f = uploaded_or_pil
+    if f is None: return None
+    if is_pdf_file(f):
+        img = convert_pdf_first_page_to_pil(f)
+        if img is not None: return img
+    if is_heic_file(f):
+        try:
+            import pillow_heif
+            heif = pillow_heif.read_heif(f.getvalue())
+            img = Image.frombytes(heif.mode, heif.size, heif.data, "raw")
+            return img.convert("RGB")
+        except Exception:
+            pass
+    try:
+        data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+        return Image.open(BytesIO(data)).convert("RGB")
+    except Exception:
+        return None
+
+def save_uploaded_file_as_is(uploaded, reg_id: str, suffix: str) -> str:
+    try:
+        name = str(uploaded.name)
+        ext = Path(name).suffix.lower() or ".bin"
+        dest = UPLOAD_DIR / f"{reg_id}_{suffix}{ext}"
+        data = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+        with open(dest, "wb") as f:
+            f.write(data)
+        return str(dest)
+    except Exception:
+        return ""
+
+def extract_eid_fields_from_image(uploaded_or_pil, for_guardian=False):
+    img_pil = load_any_image_for_ocr(uploaded_or_pil)
+    if img_pil is None:
+        return {"ok": False, "reason": "Não foi possível ler imagem do documento.", "data": {}}
+    buf = BytesIO(); img_pil.save(buf, format="JPEG"); img_bytes = buf.getvalue()
     ocr = google_vision_ocr_extract(img_bytes) if USE_VISION_OCR else local_heuristic_extract(img_bytes)
     likely, score, geo = is_likely_eid_card(img_bytes, ocr.get("text",""))
-
-    result = {
+    return {
         "ok": likely,
         "reason": f"confiança={score:.2f}, ratio={geo.get('ratio','?')}",
         "data": {
@@ -582,10 +612,51 @@ def extract_eid_fields_from_image(uploaded_file, for_guardian=False):
             "full_name": ocr.get("name",""),
         }
     }
-    return result
 
 # ================================
-# 8) ESTADO / NAVEGAÇÃO
+# 8) WEBCAM (streamlit-webrtc) – foco contínuo + captura
+# ================================
+RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+
+class SnapshotProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.latest_frame = None
+    def recv(self, frame):
+        self.latest_frame = frame.to_ndarray(format="bgr24")
+        return frame
+
+def webrtc_capture_block(title: str, key_prefix: str, facing="user"):
+    st.caption(title)
+    if not WEBRTC_AVAILABLE:
+        return None, st.camera_input(title + " (fallback)")
+    constraints = {
+        "video": {
+            "facingMode": facing,
+            "width": {"ideal": 1280},
+            "height": {"ideal": 720},
+            "frameRate": {"ideal": 30},
+            "advanced": [{"focusMode": "continuous"}]
+        },
+        "audio": False
+    }
+    ctx = webrtc_streamer(
+        key=f"webrtc_{key_prefix}",
+        mode=WebRtcMode.SENDONLY,
+        rtc_configuration=RTC_CFG,
+        media_stream_constraints=constraints,
+        video_processor_factory=SnapshotProcessor,
+    )
+    snap = None
+    if ctx and ctx.video_processor:
+        if st.button(f"Capturar foto – {title}", key=f"btn_{key_prefix}"):
+            frame = ctx.video_processor.latest_frame
+            if frame is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if FACE_DETECT_AVAILABLE else frame[..., ::-1]
+                snap = Image.fromarray(rgb)
+    return snap, None  # (PIL, fallback_uploaded)
+
+# ================================
+# 9) ESTADO / NAVEGAÇÃO
 # ================================
 if "screen" not in st.session_state: st.session_state["screen"]="welcome"
 if "accepted_terms" not in st.session_state: st.session_state["accepted_terms"]=False
@@ -606,7 +677,7 @@ def whatsapp_button(phone: str):
     )
 
 # ================================
-# 9) TELAS
+# 10) TELAS
 # ================================
 def screen_welcome():
     st.markdown(f"<h1 style='text-align:center;margin:0'>{st.session_state['event_name']}</h1>", unsafe_allow_html=True)
@@ -651,14 +722,46 @@ def screen_public_list():
     df = fetch_all()
     if df.empty:
         st.info("Ainda não há inscrições.")
-    else:
-        show = df[["id","first_name","last_name","academy","category","belt","weight_kg","approval_status"]].copy()
-        show["Nome"] = (show["first_name"].fillna("") + " " + show["last_name"].fillna("")).str.strip()
-        show = show.rename(columns={
-            "id":"Inscrição","academy":"Academia","category":"Categoria",
-            "belt":"Faixa","weight_kg":"Peso (kg)","approval_status":"Status"
-        })[["Inscrição","Nome","Academia","Categoria","Faixa","Peso (kg)","Status"]]
-        st.dataframe(show, use_container_width=True, height=420)
+        st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
+        return
+
+    df = df.copy()
+    def birth_year(d):
+        try:
+            return dt.date.fromisoformat(d).year
+        except Exception:
+            return None
+    df["birth_year"] = df["dob"].apply(birth_year)
+    df["age_years"] = df["age_years"].fillna(0).astype(int)
+    df["weight_div"] = df["weight_kg"].apply(weight_division)
+    df["gender"] = df["gender"].fillna("N/D")
+    df["age_division"] = df["age_division"].fillna("N/D")
+    df["belt"] = df["belt"].fillna("N/D")
+
+    grouped = df.groupby(["gender","age_division","belt","weight_div"], dropna=False)
+
+    for (gender, age_div, belt, wdiv), gdf in grouped:
+        st.markdown(f"<div class='group-title'>{gender} / {age_div} / {belt} / {wdiv} — {len(gdf)} inscrito(s)</div>", unsafe_allow_html=True)
+        for _, row in gdf.iterrows():
+            name = f"{row.get('first_name','')} {row.get('last_name','')}".strip()
+            status = (row.get("approval_status") or "Pending").strip().lower()
+            badge = f"<span class='badge-pending'>Pendente</span>" if status=="pending" else "<span class='badge-approved'>Aprovado</span>"
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            # foto
+            if row.get("profile_photo_path") and Path(row["profile_photo_path"]).exists():
+                st.image(row["profile_photo_path"], width=90)
+            else:
+                st.image(Image.new("RGB",(90,90),(230,230,230)), width=90)
+            # meta
+            meta = []
+            by = row.get("birth_year"); ag = row.get("age_years")
+            meta.append(f"<b>{name or '(Sem nome)'}</b> {badge}")
+            if by: meta.append(f"Nasc.: {by}  •  Idade: {ag} anos")
+            if row.get("academy"): meta.append(f"Academia: {row['academy']}")
+            meta.append(f"Divisão: {gender} / {age_div} / {belt} / {row.get('weight_div','N/D')}")
+            st.markdown(f"<div class='meta'>{'<br>'.join(meta)}</div>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
     st.markdown("---")
     st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
 
@@ -673,9 +776,6 @@ def stats_view(embed: bool=False):
     st.subheader("Total por categoria")
     st.dataframe(totals, use_container_width=True)
     st.bar_chart(totals.set_index("category"))
-    if {"category","belt"}.issubset(df.columns):
-        st.subheader("Por faixa")
-        st.dataframe(df.pivot_table(index="category", columns="belt", values="id", aggfunc="count", fill_value=0), use_container_width=True)
 
 def admin_view():
     st.subheader("Painel do Organizador")
@@ -686,7 +786,7 @@ def admin_view():
     for _, row in df.iterrows():
         name = f"{row.get('first_name','')} {row.get('last_name','')}".strip()
         status = (row.get("approval_status") or "Pending").strip()
-        badge = "<span class='badge-pending'>Pendente de aprovação</span>" if status.lower()=="pending" else ""
+        badge = "<span class='badge-pending'>Pendente de aprovação</span>" if status.lower()=="pending" else "<span class='badge-approved'>Aprovado</span>"
         header = (name or row.get('id','(sem id)')) + " " + badge
         with st.expander(header, expanded=False):
             meta = {
@@ -713,10 +813,23 @@ def admin_view():
             st.write(meta)
             if row.get("profile_photo_path") and Path(row["profile_photo_path"]).exists():
                 st.image(row["profile_photo_path"], caption="Foto de Perfil", width=160)
-            if row.get("id_doc_photo_path") and Path(row["id_doc_photo_path"]).exists():
-                st.image(row["id_doc_photo_path"], caption="Documento do atleta", width=220)
+
+            # Documento do atleta: se for PDF, oferece download; senão, exibe.
+            doc_path = row.get("id_doc_photo_path")
+            if doc_path and Path(doc_path).exists():
+                if doc_path.lower().endswith(".pdf"):
+                    with open(doc_path, "rb") as f:
+                        st.download_button("Baixar documento (PDF)", f, file_name=Path(doc_path).name, mime="application/pdf", key=f"dlpdf_{row['id']}")
+                else:
+                    st.image(doc_path, caption="Documento do atleta", width=220)
+
             if row.get("guardian_eid_photo_path") and Path(row["guardian_eid_photo_path"]).exists():
-                st.image(row["guardian_eid_photo_path"], caption="EID do responsável", width=220)
+                gpath = row["guardian_eid_photo_path"]
+                if gpath.lower().endswith(".pdf"):
+                    with open(gpath, "rb") as f:
+                        st.download_button("Baixar EID do responsável (PDF)", f, file_name=Path(gpath).name, mime="application/pdf", key=f"dlpdfg_{row['id']}")
+                else:
+                    st.image(gpath, caption="EID do responsável", width=220)
 
             jpg = generate_registration_jpg(row, st.session_state["event_name"], st.session_state["region"])
             st.download_button("Baixar inscrição (JPG)", data=jpg,
@@ -745,8 +858,7 @@ def screen_admin_gate():
             st.session_state["admin_ok"]=True
         else:
             st.error("Senha incorreta.")
-    if st.session_state.get("admin_ok"):
-        admin_view()
+    if st.session_state.get("admin_ok"): admin_view()
     st.markdown("---")
     st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
 
@@ -770,19 +882,9 @@ def render_edit_form(best_row):
             coach      = st.text_input("Professor/Coach", value=best_row.get("coach",""))
             coach_phone= st.text_input("Telefone do Professor (05_-___-____)", value=best_row.get("coach_phone",""))
         st.markdown("Nova foto de perfil (opcional)")
-        new_profile = st.camera_input("Nova foto de perfil") or st.file_uploader("Ou enviar arquivo", type=["jpg","jpeg","png"], key=f"file_{best_row['id']}")
+        snap, fallback = webrtc_capture_block("Nova foto de perfil (editar)", f"edit_{best_row['id']}_profile")
+        new_profile = snap or fallback
         submitted_update = st.form_submit_button("Salvar alterações")
-
-    try:
-        mem_jpg = generate_membership_card(best_row.get("profile_photo_path",""), best_row.get("id",""),
-                                           best_row.get("eid",""), best_row.get("age_years",0),
-                                           f"{best_row.get('first_name','')} {best_row.get('last_name','')}".strip(),
-                                           best_row.get("belt",""))
-        st.download_button("Baixar carteirinha (JPG)", data=mem_jpg,
-                           file_name=f"membership_{best_row['id']}.jpg", mime="image/jpeg",
-                           key=f"dl_edit_member_{best_row['id']}")
-    except Exception:
-        pass
 
     if submitted_update:
         first = title_capitalize(first); last = title_capitalize(last)
@@ -817,8 +919,9 @@ def screen_update_registration():
         st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu")); return
     tab1, tab2 = st.tabs(["Face ID (selfie)", "ID da inscrição"])
     with tab1:
-        st.write("Envie uma selfie recente do atleta.")
-        qfile = st.camera_input("Tirar selfie") or st.file_uploader("Ou enviar arquivo", type=["jpg","jpeg","png"], key="upload_edit")
+        st.write("Tire uma selfie recente do atleta.")
+        snap, fallback = webrtc_capture_block("Selfie do atleta", "selfie", facing="user")
+        qfile = snap or fallback
         if qfile:
             q_hash = compute_phash(crop_face_from_uploaded(qfile))
             if not q_hash:
@@ -854,32 +957,26 @@ def screen_new_registration():
         if k in st.session_state: st.session_state[k] = eid_format_live(st.session_state[k])
     if "dob" in st.session_state: st.session_state["dob"] = date_mask_live(st.session_state["dob"])
 
-    # --- APLICAÇÃO DE DADOS DE OCR (ANTES DE CRIAR OS WIDGETS) ---
+    # Buffers de OCR aplicados antes dos widgets
     if st.session_state.get("ocr_apply_atleta"):
         data = st.session_state.pop("ocr_apply_atleta")
-        if data.get("eid"):
-            st.session_state["eid"] = eid_format_live(data["eid"])
-        if data.get("dob"):
-            st.session_state["dob"] = date_mask_live(data["dob"])
-        if data.get("nationality"):
-            st.session_state["nationality"] = data["nationality"]
+        if data.get("eid"): st.session_state["eid"] = eid_format_live(data["eid"])
+        if data.get("dob"): st.session_state["dob"] = date_mask_live(data["dob"])
+        if data.get("nationality"): st.session_state["nationality"] = data["nationality"]
         if data.get("full_name"):
-            tokens = data["full_name"].split()
-            if tokens:
-                st.session_state["first_name"] = title_capitalize(tokens[0])
-                st.session_state["last_name"]  = title_capitalize(" ".join(tokens[1:])) if len(tokens)>1 else st.session_state.get("last_name","")
-
+            tok = data["full_name"].split()
+            if tok:
+                st.session_state["first_name"] = title_capitalize(tok[0])
+                st.session_state["last_name"]  = title_capitalize(" ".join(tok[1:])) if len(tok)>1 else st.session_state.get("last_name","")
     if st.session_state.get("ocr_apply_guardian"):
         data = st.session_state.pop("ocr_apply_guardian")
-        if data.get("eid"):
-            st.session_state["guardian_eid"] = eid_format_live(data["eid"])
-        if data.get("full_name"):
-            st.session_state["guardian_name"] = title_capitalize(data["full_name"])
+        if data.get("eid"): st.session_state["guardian_eid"] = eid_format_live(data["eid"])
+        if data.get("full_name"): st.session_state["guardian_name"] = title_capitalize(data["full_name"])
 
     st.title("Formulário de Inscrição")
     st.caption("Preencha seus dados. Campos com * são obrigatórios.")
 
-    # --- PESSOAIS ---
+    # PESSOAIS
     st.subheader("Dados pessoais")
     colA, colB = st.columns(2)
     with colA:
@@ -892,12 +989,11 @@ def screen_new_registration():
         email      = st.text_input("E-mail*", key="email", placeholder="email@exemplo.com")
         phone_in   = st.text_input("Telefone/WhatsApp (05_-___-____)*", key="phone", placeholder="052-123-4567")
         dob_in     = st.text_input("Data de nascimento (dd/mm/aaaa)*", key="dob", placeholder="dd/mm/aaaa")
-        # idade automática
         dob_date = parse_masked_date(st.session_state.get("dob",""))
         age_years = compute_age_year_based(dob_date.year) if dob_date else 0
         st.text_input("Idade (auto)", value=str(age_years if age_years else ""), disabled=True)
 
-    # --- ACADEMIA / COACH ---
+    # ACADEMIA
     st.subheader("Academia")
     academies = fetch_distinct_academies()
     options = ["Selecione...", "Minha academia não está na lista"] + academies
@@ -908,34 +1004,48 @@ def screen_new_registration():
     coach      = st.text_input("Professor/Coach", key="coach", placeholder="Nome do coach")
     coach_phone= st.text_input("Telefone do Professor (05_-___-____)", key="coach_phone", placeholder="052-123-4567")
 
-    # --- FOTOS ---
+    # --- DOCUMENTOS ---
     st.subheader("Documentos")
-    profile_img = st.camera_input("Foto de Perfil (rosto visível)*", key="profile_img")
-    id_doc_img  = st.camera_input("Documento de Identificação do atleta (frente)*", key="id_doc_img")
 
-    # Botão para ler dados da EID (atleta) – usa buffer + rerun
+    # Perfil (selfie): câmera frontal (WebRTC) com fallback
+    snap_prof, fb_prof = webrtc_capture_block("Foto de Perfil (rosto visível)*", "profile_selfie", facing="user")
+    profile_img = snap_prof or fb_prof
+
+    # Documento do atleta: duas opções (foto ou upload)
+    doc_opt = st.radio("Como fornecer o documento do atleta?", ["Tirar foto agora", "Enviar arquivo (jpg/png/heic/pdf)"],
+                       index=0, horizontal=True)
+    id_doc_source = None   # será PIL (foto) ou UploadedFile (upload)
+    if doc_opt == "Tirar foto agora":
+        snap_id, fb_id = webrtc_capture_block("EID do atleta (frente)*", "athlete_eid", facing="environment")
+        id_doc_source = snap_id or fb_id
+    else:
+        id_doc_upload = st.file_uploader("Enviar arquivo do documento*", type=["jpg","jpeg","png","heic","pdf"], key="id_doc_upload")
+        id_doc_source = id_doc_upload
+
+    # Ler dados da EID (atleta)
     colx, _ = st.columns([1,4])
     with colx:
         if st.button("Ler dados da EID do atleta"):
-            res = extract_eid_fields_from_image(id_doc_img)
+            res = extract_eid_fields_from_image(id_doc_source)
             if not res["ok"]:
-                st.warning(f"Foto pode não ser uma EID ({res['reason']}). Mesmo assim tentando aproveitar dados extraídos.")
+                st.warning(f"Foto/arquivo pode não ser uma EID ({res['reason']}). Mesmo assim tentando aproveitar dados extraídos.")
             st.session_state["ocr_apply_atleta"] = res.get("data", {})
             st.rerun()
 
-    # --- COMPETIÇÃO (sem modalidade) ---
+    # COMPETIÇÃO
     st.subheader("Informações de Competição")
     belt        = st.selectbox("Faixa*", FAIXAS_GI, key="belt")
     weight_kg   = st.number_input("Peso atual do atleta (kg)*", min_value=0.0, step=0.1, key="weight_kg")
 
-    # --- RESPONSÁVEL (menor de 18) ---
+    # RESPONSÁVEL (menor de 18)
     if age_years and age_years < 18:
         st.subheader("Responsável legal (obrigatório para menor de 18)")
         guardian_name  = st.text_input("Nome completo do responsável*", key="guardian_name")
         guardian_eid   = st.text_input("EID do responsável (784-####-#######-#)*", key="guardian_eid")
         guardian_phone = st.text_input("Telefone do responsável (05_-___-____)*", key="guardian_phone")
-        guardian_eid_photo = st.camera_input("Foto da EID do responsável (frente)*", key="guardian_eid_photo")
-
+        # Mantivemos captura por foto aqui (pode-se replicar o upload igual ao atleta se quiser)
+        snap_geid, fb_geid = webrtc_capture_block("Foto da EID do responsável (frente)*", "guardian_eid", facing="environment")
+        guardian_eid_photo = snap_geid or fb_geid
         colg, _ = st.columns([1,4])
         with colg:
             if st.button("Ler dados da EID do responsável"):
@@ -948,7 +1058,7 @@ def screen_new_registration():
         guardian_name = guardian_eid = guardian_phone = ""
         guardian_eid_photo = None
 
-    # --- DIVISÃO PERFEITA (preview) ---
+    # PRÉVIA DA DIVISÃO
     if all([gender, belt, weight_kg, age_years]):
         age_div = age_division_by_year(age_years)
         st.markdown("<div class='preview-box'>", unsafe_allow_html=True)
@@ -956,22 +1066,20 @@ def screen_new_registration():
         st.caption("Revise antes de enviar.")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- CONSENTIMENTO + ENVIAR ---
+    # CONSENTIMENTO + ENVIAR
     st.subheader("Termo de Consentimento")
     consent = st.checkbox("Eu li e concordo com o termo de consentimento*", key="consent")
 
     submitted = st.button("Enviar inscrição")
-
     if submitted:
         errors = set()
-        must = ["first_name","last_name","email","phone","gender","nationality","belt","weight_kg","consent","dob","profile_img","id_doc_img","academy_choice","eid"]
+        must = ["first_name","last_name","email","phone","gender","nationality","belt","weight_kg","consent","dob","academy_choice","eid"]
         for k in must:
             if not st.session_state.get(k): errors.add(k)
-
+        if profile_img is None: errors.add("profile_img")
+        if id_doc_source is None: errors.add("id_doc_img")
         if st.session_state.get("academy_choice") == "Minha academia não está na lista" and not st.session_state.get("academy_other"):
             errors.add("academy_other")
-
-        # validações específicas
         if st.session_state.get("eid") and not eid_is_valid(st.session_state["eid"]):
             errors.add("eid"); st.error("EID do atleta inválido. Use o formato 784-####-#######-#.")
         if dob_date is None:
@@ -985,15 +1093,12 @@ def screen_new_registration():
                     errors.add("profile_img"); st.error("A foto de perfil não parece conter um rosto.")
                 elif faces_profile > 1:
                     errors.add("profile_img"); st.error("Detectamos mais de uma pessoa na foto de perfil.")
-
-        # menor de idade
         if age_years and age_years < 18:
             if not st.session_state.get("guardian_name"): errors.add("guardian_name")
             if not st.session_state.get("guardian_eid") or not eid_is_valid(st.session_state.get("guardian_eid","")):
                 errors.add("guardian_eid"); st.error("EID do responsável inválido.")
             if not st.session_state.get("guardian_phone"): errors.add("guardian_phone")
-            if st.session_state.get("guardian_eid_photo") is None:
-                errors.add("guardian_eid_photo")
+            if guardian_eid_photo is None: errors.add("guardian_eid_photo")
 
         st.session_state["errors"] = errors
         if errors:
@@ -1012,10 +1117,16 @@ def screen_new_registration():
         age_div = age_division_by_year(age_years)
         category = age_div
 
-        # salvar imagens
+        # salvar imagens e documento
         reg_id = str(uuid.uuid4())[:8].upper()
         profile_photo_path = save_image(profile_img, reg_id, "profile")
-        id_doc_photo_path = save_image(id_doc_img, reg_id, "id_doc")
+
+        # Documento: se for PIL (foto) -> salva JPG; se upload -> mantém extensão
+        if isinstance(id_doc_source, Image.Image):
+            id_doc_photo_path = save_image(id_doc_source, reg_id, "id_doc")
+        else:
+            id_doc_photo_path = save_uploaded_file_as_is(id_doc_source, reg_id, "id_doc")
+
         guardian_eid_photo_path = save_image(guardian_eid_photo, reg_id, "guardian_eid") if guardian_eid_photo else ""
         face_crop_img = crop_face_from_uploaded(profile_img)
         face_phash = compute_phash(face_crop_img)
@@ -1045,7 +1156,6 @@ def screen_new_registration():
             st.info("Status da sua inscrição: Pendente de aprovação.")
             st.info(f"Atletas já inscritos na categoria '{category}': {count_by_category(category)}")
 
-            # Cartão + Carteirinha
             jpg_bytes = generate_registration_jpg(row, st.session_state["event_name"], st.session_state["region"])
             st.download_button("Baixar inscrição (JPG)", data=jpg_bytes, file_name=f"inscricao_{row['id']}.jpg", mime="image/jpeg")
 
@@ -1056,22 +1166,15 @@ def screen_new_registration():
                 st.image(member_card, caption="Pré-visualização da carteirinha", use_column_width=True)
             except Exception as e:
                 st.warning(f"Não foi possível gerar a carteirinha: {e}")
-
-            if WHATSAPP_PHONE.strip():
-                msg = f"Olá! Minha inscrição do evento {st.session_state['event_name']} foi enviada. Meu ID é {reg_id}."
-                phone_clean = WHATSAPP_PHONE.replace("+", "").replace(" ", "").replace("-", "")
-                wa_url = f"https://wa.me/{phone_clean}?text=" + urllib.parse.quote(msg)
-                st.markdown(f"[Falar com a organização no WhatsApp]({wa_url})")
         except Exception as e:
             st.error(f"Erro ao salvar inscrição: {e}")
 
     st.markdown("---"); st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
 
 # ================================
-# 10) ROTEAMENTO + WHATSAPP
+# 11) ROTEAMENTO + WHATSAPP
 # ================================
 whatsapp_button(WHATSAPP_PHONE)
-
 if st.session_state["screen"] == "welcome":
     screen_welcome()
 elif not st.session_state.get("accepted_terms", False):
