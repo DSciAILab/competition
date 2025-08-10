@@ -24,12 +24,18 @@ except Exception:
 
 import imagehash
 
-# streamlit-webrtc (opcional com fallback)
+# streamlit-webrtc (opcional com fallback + stubs p/ evitar NameError)
 WEBRTC_AVAILABLE = True
 try:
     from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase
 except Exception:
     WEBRTC_AVAILABLE = False
+    # Stubs para evitar NameError quando o pacote não está disponível
+    webrtc_streamer = None
+    WebRtcMode = None
+    RTCConfiguration = None
+    class VideoProcessorBase:  # stub
+        pass
 
 # ====== OCR (Google Vision) opcional ======
 USE_VISION_OCR = False
@@ -539,7 +545,7 @@ def is_likely_eid_card(image_bytes: bytes, ocr_text: str) -> (bool, float, dict)
     score = (0.3 if ratio_ok else 0.0) + (0.5 if eid_found else 0.0) + (0.2 if kw_found else 0.0)
     return (score >= 0.6), score, details
 
-# ---------- NOVOS HELPERS p/ UPLOAD (jpg/png/heic/pdf) ----------
+# ---------- HELPERS p/ UPLOAD (jpg/png/heic/pdf) ----------
 def is_pdf_file(uploaded):
     try:
         return str(uploaded.name).lower().endswith(".pdf")
@@ -616,7 +622,10 @@ def extract_eid_fields_from_image(uploaded_or_pil, for_guardian=False):
 # ================================
 # 8) WEBCAM (streamlit-webrtc) – foco contínuo + captura
 # ================================
-RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+if WEBRTC_AVAILABLE and RTCConfiguration is not None:
+    RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+else:
+    RTC_CFG = None
 
 class SnapshotProcessor(VideoProcessorBase):
     def __init__(self):
@@ -626,9 +635,16 @@ class SnapshotProcessor(VideoProcessorBase):
         return frame
 
 def webrtc_capture_block(title: str, key_prefix: str, facing="user"):
+    """
+    Renderiza um bloco de câmera via streamlit-webrtc com foco contínuo (quando suportado).
+    Retorna uma PIL Image quando o usuário clica "Capturar foto".
+    """
     st.caption(title)
-    if not WEBRTC_AVAILABLE:
+
+    # Fallback imediato quando WebRTC não está disponível
+    if not WEBRTC_AVAILABLE or webrtc_streamer is None or RTC_CFG is None:
         return None, st.camera_input(title + " (fallback)")
+
     constraints = {
         "video": {
             "facingMode": facing,
@@ -639,6 +655,7 @@ def webrtc_capture_block(title: str, key_prefix: str, facing="user"):
         },
         "audio": False
     }
+
     ctx = webrtc_streamer(
         key=f"webrtc_{key_prefix}",
         mode=WebRtcMode.SENDONLY,
@@ -647,11 +664,15 @@ def webrtc_capture_block(title: str, key_prefix: str, facing="user"):
         video_processor_factory=SnapshotProcessor,
     )
     snap = None
-    if ctx and ctx.video_processor:
+    if ctx and getattr(ctx, "video_processor", None):
         if st.button(f"Capturar foto – {title}", key=f"btn_{key_prefix}"):
             frame = ctx.video_processor.latest_frame
             if frame is not None:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if FACE_DETECT_AVAILABLE else frame[..., ::-1]
+                if FACE_DETECT_AVAILABLE:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                else:
+                    # frame é BGR; inverte canais manualmente
+                    rgb = frame[..., ::-1]
                 snap = Image.fromarray(rgb)
     return snap, None  # (PIL, fallback_uploaded)
 
@@ -1043,7 +1064,6 @@ def screen_new_registration():
         guardian_name  = st.text_input("Nome completo do responsável*", key="guardian_name")
         guardian_eid   = st.text_input("EID do responsável (784-####-#######-#)*", key="guardian_eid")
         guardian_phone = st.text_input("Telefone do responsável (05_-___-____)*", key="guardian_phone")
-        # Mantivemos captura por foto aqui (pode-se replicar o upload igual ao atleta se quiser)
         snap_geid, fb_geid = webrtc_capture_block("Foto da EID do responsável (frente)*", "guardian_eid", facing="environment")
         guardian_eid_photo = snap_geid or fb_geid
         colg, _ = st.columns([1,4])
@@ -1082,6 +1102,7 @@ def screen_new_registration():
             errors.add("academy_other")
         if st.session_state.get("eid") and not eid_is_valid(st.session_state["eid"]):
             errors.add("eid"); st.error("EID do atleta inválido. Use o formato 784-####-#######-#.")
+        dob_date = parse_masked_date(st.session_state.get("dob",""))
         if dob_date is None:
             errors.add("dob"); st.error("Data de nascimento inválida. Use dd/mm/aaaa.")
         if "profile_img" not in errors and profile_img is not None:
@@ -1093,6 +1114,8 @@ def screen_new_registration():
                     errors.add("profile_img"); st.error("A foto de perfil não parece conter um rosto.")
                 elif faces_profile > 1:
                     errors.add("profile_img"); st.error("Detectamos mais de uma pessoa na foto de perfil.")
+        if dob_date:
+            age_years = compute_age_year_based(dob_date.year)
         if age_years and age_years < 18:
             if not st.session_state.get("guardian_name"): errors.add("guardian_name")
             if not st.session_state.get("guardian_eid") or not eid_is_valid(st.session_state.get("guardian_eid","")):
