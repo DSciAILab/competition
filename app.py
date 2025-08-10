@@ -1,6 +1,7 @@
 # ================================
-# app.py – ADSS Jiu-Jitsu Competition (Versão Complexa)
+# app.py – ADSS Jiu-Jitsu Competition (Versão Complexa c/ Patch OCR)
 # Mobile-first + máscaras live + OCR de EID (Google Vision opcional) + fallback local
+# Patch: aplica dados de OCR via buffers no início da tela e usa st.rerun()
 # Divisão preview, responsável de menor, peso atual, carteirinha JPG, Face ID, Admin
 # ================================
 
@@ -504,13 +505,11 @@ def google_vision_ocr_extract(image_bytes: bytes) -> dict:
                 except Exception:
                     pass
 
-        # Nacionalidade e Nome por chaves em linhas
-        lines = to_text_lines(full_text)
         # Nacionalidade
+        lines = to_text_lines(full_text)
         for li in lines:
             low = li.lower()
             if any(k in low for k in NATIONALITY_KEYS):
-                # tenta pegar depois de ":" ou no fim
                 parts = re.split(r"[:\-]", li, maxsplit=1)
                 cand = parts[1].strip() if len(parts) > 1 else li
                 out["nationality"] = squeeze_spaces(re.sub(r"(?i)nationality", "", cand)).strip()
@@ -538,11 +537,8 @@ def google_vision_ocr_extract(image_bytes: bytes) -> dict:
         return out
 
 def local_heuristic_extract(image_bytes: bytes) -> dict:
-    """Fallback local com OCR simplificado: tenta achar EID, datas e algumas palavras-chave via pyzbar/nada (regex no texto vazio).
-       Aqui, como não temos OCR local leve garantido, usaremos apenas verificação geométrica e deixamos extração mínima."""
+    """Fallback local: mantém leve; sem OCR adicional (pode plugar easyocr aqui se quiser)."""
     out = {"text": "", "eid": "", "dob": "", "nationality": "", "name": "", "confidence": 0.0, "keywords_found": []}
-    # Podemos tentar usar pytesseract/easyocr/paddleocr se instalados; para manter leve, apenas devolvemos vazio.
-    # Você pode plugar easyocr aqui se desejar.
     return out
 
 def is_likely_eid_card(image_bytes: bytes, ocr_text: str) -> (bool, float, dict):
@@ -553,7 +549,7 @@ def is_likely_eid_card(image_bytes: bytes, ocr_text: str) -> (bool, float, dict)
         w, h = img.size
         ratio = w / h if h else 0
         details["ratio"] = ratio
-        ratio_ok = 1.427 <= ratio <= 1.745   # 1.586 ± ~10%
+        ratio_ok = 1.427 <= ratio <= 1.745   # ~1.586 ± ~10%
     except Exception:
         ratio_ok = False
 
@@ -561,7 +557,6 @@ def is_likely_eid_card(image_bytes: bytes, ocr_text: str) -> (bool, float, dict)
     eid_found = bool(EID_REGEX.search((ocr_text or "").replace(" ", "")))
     kw_found = any(kw in ocr_low for kw in KEYWORDS_EID)
 
-    # score simples
     score = 0.0
     if ratio_ok: score += 0.3
     if eid_found: score += 0.5
@@ -587,7 +582,6 @@ def extract_eid_fields_from_image(uploaded_file, for_guardian=False):
             "full_name": ocr.get("name",""),
         }
     }
-    # Fail-soft: se não for “ok”, ainda assim retorna o que conseguiu
     return result
 
 # ================================
@@ -860,6 +854,28 @@ def screen_new_registration():
         if k in st.session_state: st.session_state[k] = eid_format_live(st.session_state[k])
     if "dob" in st.session_state: st.session_state["dob"] = date_mask_live(st.session_state["dob"])
 
+    # --- APLICAÇÃO DE DADOS DE OCR (ANTES DE CRIAR OS WIDGETS) ---
+    if st.session_state.get("ocr_apply_atleta"):
+        data = st.session_state.pop("ocr_apply_atleta")
+        if data.get("eid"):
+            st.session_state["eid"] = eid_format_live(data["eid"])
+        if data.get("dob"):
+            st.session_state["dob"] = date_mask_live(data["dob"])
+        if data.get("nationality"):
+            st.session_state["nationality"] = data["nationality"]
+        if data.get("full_name"):
+            tokens = data["full_name"].split()
+            if tokens:
+                st.session_state["first_name"] = title_capitalize(tokens[0])
+                st.session_state["last_name"]  = title_capitalize(" ".join(tokens[1:])) if len(tokens)>1 else st.session_state.get("last_name","")
+
+    if st.session_state.get("ocr_apply_guardian"):
+        data = st.session_state.pop("ocr_apply_guardian")
+        if data.get("eid"):
+            st.session_state["guardian_eid"] = eid_format_live(data["eid"])
+        if data.get("full_name"):
+            st.session_state["guardian_name"] = title_capitalize(data["full_name"])
+
     st.title("Formulário de Inscrição")
     st.caption("Preencha seus dados. Campos com * são obrigatórios.")
 
@@ -897,27 +913,15 @@ def screen_new_registration():
     profile_img = st.camera_input("Foto de Perfil (rosto visível)*", key="profile_img")
     id_doc_img  = st.camera_input("Documento de Identificação do atleta (frente)*", key="id_doc_img")
 
-    # Botão para ler dados da EID (atleta)
+    # Botão para ler dados da EID (atleta) – usa buffer + rerun
     colx, _ = st.columns([1,4])
     with colx:
         if st.button("Ler dados da EID do atleta"):
             res = extract_eid_fields_from_image(id_doc_img)
             if not res["ok"]:
                 st.warning(f"Foto pode não ser uma EID ({res['reason']}). Mesmo assim tentando aproveitar dados extraídos.")
-            data = res["data"]
-            # Preenche o que achar
-            if data.get("eid"): st.session_state["eid"] = eid_format_live(data["eid"])
-            if data.get("dob"):
-                st.session_state["dob"] = date_mask_live(data["dob"])
-            if data.get("nationality"):
-                # não forçamos a entrar na lista; usuário ajusta se necessário
-                st.session_state["nationality"] = data["nationality"]
-            if data.get("full_name"):
-                # Split simples: primeiro token -> nome, resto -> sobrenome
-                tokens = data["full_name"].split()
-                if tokens:
-                    st.session_state["first_name"] = title_capitalize(tokens[0])
-                    st.session_state["last_name"]  = title_capitalize(" ".join(tokens[1:])) if len(tokens)>1 else st.session_state.get("last_name","")
+            st.session_state["ocr_apply_atleta"] = res.get("data", {})
+            st.rerun()
 
     # --- COMPETIÇÃO (sem modalidade) ---
     st.subheader("Informações de Competição")
@@ -938,10 +942,8 @@ def screen_new_registration():
                 resg = extract_eid_fields_from_image(guardian_eid_photo, for_guardian=True)
                 if not resg["ok"]:
                     st.warning(f"EID do responsável pode não ser válida ({resg['reason']}).")
-                data = resg["data"]
-                if data.get("eid"): st.session_state["guardian_eid"] = eid_format_live(data["eid"])
-                if data.get("full_name"): st.session_state["guardian_name"] = title_capitalize(data["full_name"])
-                # telefone não vem da EID; usuário preencherá
+                st.session_state["ocr_apply_guardian"] = resg.get("data", {})
+                st.rerun()
     else:
         guardian_name = guardian_eid = guardian_phone = ""
         guardian_eid_photo = None
