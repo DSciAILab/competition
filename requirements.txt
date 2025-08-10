@@ -1,10 +1,23 @@
-streamlit
-pandas
-sqlalchemy
-pillow
-pycountry
-deep-translator
-opencv-python-headless
-numpy
-ImageHash
-qrcode   # opcional (QR no JPG)
+# --- Base do Streamlit e captura de imagens ---
+streamlit==1.37.1
+streamlit-webrtc==0.47.1
+av==10.0.0
+
+# --- Processamento de imagem ---
+Pillow==10.3.0
+opencv-python-headless==4.10.0.84
+imagehash==4.3.1
+
+# --- OCR local (Tesseract) ---
+pytesseract==0.3.10
+
+# --- Google Vision OCR (opcional) ---
+google-cloud-vision==3.7.2
+
+# --- PDFs e HEIC ---
+pdf2image==1.17.0
+pillow-heif==0.14.0
+
+# --- Utilitários ---
+numpy==1.26.4
+python-dateutil==2.9.0
