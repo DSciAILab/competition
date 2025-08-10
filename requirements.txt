@@ -7,3 +7,4 @@ deep-translator
 opencv-python-headless
 numpy
 ImageHash
+qrcode   # opcional (QR no JPG)
