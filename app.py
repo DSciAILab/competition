@@ -1,12 +1,13 @@
 # ================================
 # app.py – ADSS Jiu-Jitsu Competition
-# + Aba Events (admin) para cadastro/gestão de eventos
-# + Seleção de evento ativo antes do menu principal
-# + Todas as ações vinculadas ao evento ativo (event_id)
+# Sem OCR (removido): sem Google Vision, sem leitura automática da EID
+# Eventos (aba admin), seleção de evento ativo, inscrições por evento
+# WebRTC com autofoco (opcional) + fallback st.camera_input
+# Lista pública agrupada, carteirinha JPG, Face ID (pHash) p/ edição, Admin
 # ================================
 
 # ---------- IMPORTS ----------
-import os, re, uuid, urllib.parse, base64, datetime as dt
+import os, re, uuid, urllib.parse, datetime as dt
 from pathlib import Path
 from io import BytesIO
 
@@ -31,36 +32,11 @@ try:
     from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase
 except Exception:
     WEBRTC_AVAILABLE = False
-    # Stubs para evitar NameError quando o pacote não está disponível
     webrtc_streamer = None
     WebRtcMode = None
     RTCConfiguration = None
     class VideoProcessorBase:  # stub
         pass
-
-# ====== OCR (Google Vision) opcional ======
-USE_VISION_OCR = False
-try:
-    if "USE_VISION_OCR" in st.secrets:
-        USE_VISION_OCR = str(st.secrets["USE_VISION_OCR"]).strip().lower() in ("1","true","yes","on")
-except Exception:
-    pass
-if not USE_VISION_OCR:
-    USE_VISION_OCR = str(os.getenv("USE_VISION_OCR","")).strip().lower() in ("1","true","yes","on")
-
-if USE_VISION_OCR:
-    try:
-        from google.cloud import vision
-        if "GCP_CREDS_B64" in st.secrets:
-            creds_b64 = st.secrets["GCP_CREDS_B64"]
-            cred_path = "gcp_creds.json"
-            with open(cred_path, "w") as f:
-                f.write(base64.b64decode(creds_b64.encode()).decode())
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
-        vision_client = vision.ImageAnnotatorClient()
-    except Exception as e:
-        USE_VISION_OCR = False
-        st.warning(f"OCR via Google Vision não pôde ser inicializado: {e}. Usando fallback local.")
 
 # ================================
 # 1) CONFIG GLOBAL
@@ -115,8 +91,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS registrations (
             id TEXT PRIMARY KEY,
             created_at TEXT,
-            event_id TEXT,               -- <- novo: vínculo com events.id
-            event_name TEXT,             -- legibilidade
+            event_id TEXT,
+            event_name TEXT,
             first_name TEXT,
             last_name TEXT,
             full_name_en TEXT,
@@ -154,12 +130,12 @@ def init_db():
             id TEXT PRIMARY KEY,
             created_at TEXT,
             name TEXT,
-            date TEXT,            -- ISO date (yyyy-mm-dd) ou datetime
+            date TEXT,
             location TEXT,
-            manager TEXT,         -- responsável
-            divisions TEXT,       -- texto livre (divisões ativas)
+            manager TEXT,
+            divisions TEXT,
             description TEXT,
-            status TEXT           -- 'Ativo' ou 'Inativo'
+            status TEXT
         );
         """))
         # Migrações tolerantes
@@ -275,6 +251,18 @@ def save_image(file_or_pil, reg_id: str, suffix: str, max_size=(800, 800)) -> st
     dest = UPLOAD_DIR / f"{reg_id}_{suffix}.jpg"
     img.save(dest, format="JPEG", quality=85)
     return str(dest)
+
+def save_uploaded_file_as_is(uploaded, reg_id: str, suffix: str) -> str:
+    try:
+        name = str(uploaded.name)
+        ext = Path(name).suffix.lower() or ".bin"
+        dest = UPLOAD_DIR / f"{reg_id}_{suffix}{ext}"
+        data = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+        with open(dest, "wb") as f:
+            f.write(data)
+        return str(dest)
+    except Exception:
+        return ""
 
 def count_faces_in_image(file_or_pil) -> int:
     if not FACE_DETECT_AVAILABLE: return -1
@@ -516,164 +504,7 @@ def weight_division(weight_kg: float) -> str:
     return f"{lo:.0f}–{hi:.1f} kg"
 
 # ================================
-# 7) OCR / VERIFICAÇÃO EID
-# ================================
-EID_REGEX = re.compile(r"784-\d{4}-\d{7}-\d")
-DATE_REGEXES = [
-    re.compile(r"\b(\d{2})/(\d{2})/(\d{4})\b"),
-    re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
-]
-NATIONALITY_KEYS = ["nationality", "country", "citizenship"]
-NAME_KEYS = ["name", "cardholder", "card holder", "full name", "nome", "الاسم"]
-KEYWORDS_EID = ["emirates id", "united arab emirates", "identity", "authority", "emirates", "الهوية", "الإمارات"]
-
-def to_text_lines(s: str): return [l.strip() for l in (s or "").splitlines() if l.strip()]
-
-def google_vision_ocr_extract(image_bytes: bytes) -> dict:
-    out = {"text": "", "eid": "", "dob": "", "nationality": "", "name": "", "confidence": 0.0, "keywords_found": []}
-    if not USE_VISION_OCR: return out
-    try:
-        image = vision.Image(content=image_bytes)
-        resp = vision_client.document_text_detection(image=image)
-        if resp.error.message: return out
-        full_text = resp.full_text_annotation.text or ""
-        out["text"] = full_text
-        text_lower = full_text.lower()
-        out["keywords_found"] = [kw for kw in KEYWORDS_EID if kw in text_lower]
-        m = EID_REGEX.search(full_text.replace(" ", ""));  out["eid"] = m.group(0) if m else ""
-        for rx in DATE_REGEXES:
-            m = rx.search(full_text)
-            if m:
-                try:
-                    if rx.pattern.startswith(r"\b(\d{2})/"):
-                        d,mn,y = map(int, m.groups())
-                    else:
-                        y,mn,d = map(int, m.groups())
-                    _ = dt.date(y,mn,d)
-                    out["dob"] = f"{d:02d}/{mn:02d}/{y:04d}"
-                    break
-                except Exception:
-                    pass
-        lines = to_text_lines(full_text)
-        for li in lines:
-            low = li.lower()
-            if any(k in low for k in NATIONALITY_KEYS):
-                parts = re.split(r"[:\-]", li, 1)
-                cand = parts[1].strip() if len(parts) > 1 else li
-                out["nationality"] = squeeze_spaces(re.sub(r"(?i)nationality", "", cand)).strip(); break
-        for li in lines:
-            low = li.lower()
-            if any(k in low for k in NAME_KEYS):
-                parts = re.split(r"[:\-]", li, 1)
-                cand = parts[1].strip() if len(parts) > 1 else li
-                cand = re.sub(r"(?i)name|cardholder|card holder|full name|nome|الاسم", "", cand).strip()
-                out["name"] = squeeze_spaces(cand); break
-        score = 0.0
-        if out["eid"]: score += 0.4
-        if out["dob"]: score += 0.2
-        if out["nationality"]: score += 0.2
-        if out["name"]: score += 0.1
-        if out["keywords_found"]: score += 0.1
-        out["confidence"] = min(1.0, score)
-        return out
-    except Exception:
-        return out
-
-def local_heuristic_extract(image_bytes: bytes) -> dict:
-    return {"text":"", "eid":"", "dob":"", "nationality":"", "name":"", "confidence":0.0, "keywords_found":[]}
-
-def is_likely_eid_card(image_bytes: bytes, ocr_text: str) -> (bool, float, dict):
-    details = {}
-    try:
-        img = Image.open(BytesIO(image_bytes))
-        w, h = img.size; ratio = w / h if h else 0
-        details["ratio"] = ratio
-        ratio_ok = 1.427 <= ratio <= 1.745
-    except Exception:
-        ratio_ok = False
-    ocr_low = (ocr_text or "").lower()
-    eid_found = bool(EID_REGEX.search((ocr_text or "").replace(" ", "")))
-    kw_found = any(kw in ocr_low for kw in KEYWORDS_EID)
-    # <-- CUIDADO COM O PARÊNTESE: tudo numa linha para evitar SyntaxError
-    score = (0.3 if ratio_ok else 0.0) + (0.5 if eid_found else 0.0) + (0.2 if kw_found else 0.0)
-    return (score >= 0.6), score, details
-
-# ---------- HELPERS p/ UPLOAD (jpg/png/heic/pdf) ----------
-def is_pdf_file(uploaded):
-    try:
-        return str(uploaded.name).lower().endswith(".pdf")
-    except Exception:
-        return False
-
-def is_heic_file(uploaded):
-    try:
-        return str(uploaded.name).lower().endswith((".heic", ".heif"))
-    except Exception:
-        return False
-
-def convert_pdf_first_page_to_pil(uploaded):
-    try:
-        data = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
-        from pdf2image import convert_from_bytes
-        pages = convert_from_bytes(data, first_page=1, last_page=1, fmt="jpeg")
-        return pages[0] if pages else None
-    except Exception:
-        return None
-
-def load_any_image_for_ocr(uploaded_or_pil):
-    if isinstance(uploaded_or_pil, Image.Image):
-        return uploaded_or_pil
-    f = uploaded_or_pil
-    if f is None: return None
-    if is_pdf_file(f):
-        img = convert_pdf_first_page_to_pil(f)
-        if img is not None: return img
-    if is_heic_file(f):
-        try:
-            import pillow_heif
-            heif = pillow_heif.read_heif(f.getvalue())
-            img = Image.frombytes(heif.mode, heif.size, heif.data, "raw")
-            return img.convert("RGB")
-        except Exception:
-            pass
-    try:
-        data = f.getvalue() if hasattr(f, "getvalue") else f.read()
-        return Image.open(BytesIO(data)).convert("RGB")
-    except Exception:
-        return None
-
-def save_uploaded_file_as_is(uploaded, reg_id: str, suffix: str) -> str:
-    try:
-        name = str(uploaded.name)
-        ext = Path(name).suffix.lower() or ".bin"
-        dest = UPLOAD_DIR / f"{reg_id}_{suffix}{ext}"
-        data = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
-        with open(dest, "wb") as f:
-            f.write(data)
-        return str(dest)
-    except Exception:
-        return ""
-
-def extract_eid_fields_from_image(uploaded_or_pil, for_guardian=False):
-    img_pil = load_any_image_for_ocr(uploaded_or_pil)
-    if img_pil is None:
-        return {"ok": False, "reason": "Não foi possível ler imagem do documento.", "data": {}}
-    buf = BytesIO(); img_pil.save(buf, format="JPEG"); img_bytes = buf.getvalue()
-    ocr = google_vision_ocr_extract(img_bytes) if USE_VISION_OCR else local_heuristic_extract(img_bytes)
-    likely, score, geo = is_likely_eid_card(img_bytes, ocr.get("text",""))
-    return {
-        "ok": likely,
-        "reason": f"confiança={score:.2f}, ratio={geo.get('ratio','?')}",
-        "data": {
-            "eid": eid_format_live(ocr.get("eid","")),
-            "dob": ocr.get("dob",""),
-            "nationality": ocr.get("nationality",""),
-            "full_name": ocr.get("name",""),
-        }
-    }
-
-# ================================
-# 8) WEBCAM (streamlit-webrtc) – foco contínuo + captura
+# 7) WEBCAM (streamlit-webrtc) – foco contínuo + captura
 # ================================
 if WEBRTC_AVAILABLE and RTCConfiguration is not None:
     RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
@@ -721,7 +552,7 @@ def webrtc_capture_block(title: str, key_prefix: str, facing="user"):
     return snap, None  # (PIL, fallback_uploaded)
 
 # ================================
-# 9) ESTADO / NAVEGAÇÃO
+# 8) ESTADO / NAVEGAÇÃO
 # ================================
 if "screen" not in st.session_state: st.session_state["screen"]="welcome"
 if "accepted_terms" not in st.session_state: st.session_state["accepted_terms"]=False
@@ -745,7 +576,7 @@ def whatsapp_button(phone: str):
     )
 
 # ================================
-# 10) TELAS
+# 9) TELAS
 # ================================
 def screen_welcome():
     title = st.session_state.get("active_event_name") or "ADSS Jiu-Jitsu Competition"
@@ -764,15 +595,18 @@ def screen_welcome():
 """)
     agree = st.checkbox("Li e **concordo** com os termos e condições", key="agree_terms")
     st.markdown("---")
-    # Se houver eventos ativos, forçar seleção
     active_events = fetch_events(status="Ativo")
     if active_events.empty:
         st.info("Não há eventos ativos no momento. O administrador pode cadastrar/ativar um evento na aba Events.")
     else:
         ev_names = [f"{r['name']} — {r['date'][:10]} — {r['location']}" for _, r in active_events.iterrows()]
+        # índice default
+        if st.session_state.get("active_event_id") and st.session_state["active_event_id"] in set(active_events["id"]):
+            def_index = active_events.index[active_events['id']==st.session_state["active_event_id"]].tolist()[0]
+        else:
+            def_index = 0
         idx = st.selectbox("Selecione o evento ativo para continuar", options=list(range(len(ev_names))),
-                           format_func=lambda i: ev_names[i], index=0 if st.session_state.get("active_event_id") is None else
-                           max(0, active_events.index[active_events['id']==st.session_state["active_event_id"]].tolist()[0] if (st.session_state["active_event_id"] in set(active_events['id'])) else 0))
+                           format_func=lambda i: ev_names[i], index=def_index)
         chosen = active_events.iloc[idx].to_dict()
         st.markdown(f"<div class='help'>Descrição: {chosen.get('description','')}</div>", unsafe_allow_html=True)
 
@@ -1062,7 +896,6 @@ def screen_events_admin():
             st.error("Preencha os campos obrigatórios (*).")
         else:
             try:
-                # valida data simples
                 _ = dt.date.fromisoformat(date_str)
                 ev = {
                     "id": str(uuid.uuid4())[:8].upper(),
@@ -1125,9 +958,8 @@ def screen_events_admin():
     st.markdown("---")
     st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
 
-# =============== NOVO REGISTRO (agora vinculado ao evento ativo) ===============
+# =============== NOVO REGISTRO (vinculado ao evento ativo) ===============
 def screen_new_registration():
-    # Guard: precisa de evento ativo
     if not st.session_state.get("active_event_id"):
         st.warning("Selecione um evento ativo na tela inicial antes de registrar.")
         st.button("Voltar ao início", on_click=lambda: st.session_state.update(screen="welcome"))
@@ -1139,22 +971,6 @@ def screen_new_registration():
     for k in ["eid","guardian_eid"]:
         if k in st.session_state: st.session_state[k] = eid_format_live(st.session_state[k])
     if "dob" in st.session_state: st.session_state["dob"] = date_mask_live(st.session_state["dob"])
-
-    # Buffers de OCR aplicados antes dos widgets
-    if st.session_state.get("ocr_apply_atleta"):
-        data = st.session_state.pop("ocr_apply_atleta")
-        if data.get("eid"): st.session_state["eid"] = eid_format_live(data["eid"])
-        if data.get("dob"): st.session_state["dob"] = date_mask_live(data["dob"])
-        if data.get("nationality"): st.session_state["nationality"] = data["nationality"]
-        if data.get("full_name"):
-            tok = data["full_name"].split()
-            if tok:
-                st.session_state["first_name"] = title_capitalize(tok[0])
-                st.session_state["last_name"]  = title_capitalize(" ".join(tok[1:])) if len(tok)>1 else st.session_state.get("last_name","")
-    if st.session_state.get("ocr_apply_guardian"):
-        data = st.session_state.pop("ocr_apply_guardian")
-        if data.get("eid"): st.session_state["guardian_eid"] = eid_format_live(data["eid"])
-        if data.get("full_name"): st.session_state["guardian_name"] = title_capitalize(data["full_name"])
 
     st.title(f"Formulário de Inscrição — {st.session_state.get('active_event_name')}")
     st.caption("Preencha seus dados. Campos com * são obrigatórios.")
@@ -1187,7 +1003,7 @@ def screen_new_registration():
     coach      = st.text_input("Professor/Coach", key="coach", placeholder="Nome do coach")
     coach_phone= st.text_input("Telefone do Professor (05_-___-____)", key="coach_phone", placeholder="052-123-4567")
 
-    # --- DOCUMENTOS ---
+    # DOCUMENTOS (sem OCR)
     st.subheader("Documentos")
     snap_prof, fb_prof = webrtc_capture_block("Foto de Perfil (rosto visível)*", "profile_selfie", facing="user")
     profile_img = snap_prof or fb_prof
@@ -1202,15 +1018,6 @@ def screen_new_registration():
         id_doc_upload = st.file_uploader("Enviar arquivo do documento*", type=["jpg","jpeg","png","heic","pdf"], key="id_doc_upload")
         id_doc_source = id_doc_upload
 
-    colx, _ = st.columns([1,4])
-    with colx:
-        if st.button("Ler dados da EID do atleta"):
-            res = extract_eid_fields_from_image(id_doc_source)
-            if not res["ok"]:
-                st.warning(f"Foto/arquivo pode não ser uma EID ({res['reason']}). Mesmo assim tentando aproveitar dados extraídos.")
-            st.session_state["ocr_apply_atleta"] = res.get("data", {})
-            st.rerun()
-
     # COMPETIÇÃO
     st.subheader("Informações de Competição")
     belt        = st.selectbox("Faixa*", FAIXAS_GI, key="belt")
@@ -1224,14 +1031,6 @@ def screen_new_registration():
         guardian_phone = st.text_input("Telefone do responsável (05_-___-____)*", key="guardian_phone")
         snap_geid, fb_geid = webrtc_capture_block("Foto da EID do responsável (frente)*", "guardian_eid", facing="environment")
         guardian_eid_photo = snap_geid or fb_geid
-        colg, _ = st.columns([1,4])
-        with colg:
-            if st.button("Ler dados da EID do responsável"):
-                resg = extract_eid_fields_from_image(guardian_eid_photo, for_guardian=True)
-                if not resg["ok"]:
-                    st.warning(f"EID do responsável pode não ser válida ({resg['reason']}).")
-                st.session_state["ocr_apply_guardian"] = resg.get("data", {})
-                st.rerun()
     else:
         guardian_name = guardian_eid = guardian_phone = ""
         guardian_eid_photo = None
@@ -1301,17 +1100,19 @@ def screen_new_registration():
         # salvar imagens e documento
         reg_id = str(uuid.uuid4())[:8].upper()
         profile_photo_path = save_image(profile_img, reg_id, "profile")
+
         if isinstance(id_doc_source, Image.Image):
             id_doc_photo_path = save_image(id_doc_source, reg_id, "id_doc")
         else:
             id_doc_photo_path = save_uploaded_file_as_is(id_doc_source, reg_id, "id_doc")
+
         guardian_eid_photo_path = save_image(guardian_eid_photo, reg_id, "guardian_eid") if guardian_eid_photo else ""
         face_crop_img = crop_face_from_uploaded(profile_img)
         face_phash = compute_phash(face_crop_img)
 
         row = {
             "id": reg_id, "created_at": dt.datetime.utcnow().isoformat(),
-            "event_id": st.session_state.get("active_event_id"),    # vínculo
+            "event_id": st.session_state.get("active_event_id"),
             "event_name": st.session_state.get("active_event_name"),
             "first_name": first_name, "last_name": last_name, "full_name_en": full_name_en,
             "email": st.session_state["email"].strip(), "phone": phone, "eid": eid_masked,
@@ -1351,7 +1152,7 @@ def screen_new_registration():
     st.markdown("---"); st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
 
 # ================================
-# 11) ROTEAMENTO + WHATSAPP
+# 10) ROTEAMENTO + WHATSAPP
 # ================================
 whatsapp_button(WHATSAPP_PHONE)
 if st.session_state["screen"] == "welcome":
@@ -1371,4 +1172,4 @@ elif st.session_state["screen"] == "admin":
 elif st.session_state["screen"] == "events_admin":
     screen_events_admin()
 else:
-    st.session_state["screen"] = "menu"; screen_menu() 
+    st.session_state["screen"] = "menu"; screen_menu()
