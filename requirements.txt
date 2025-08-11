@@ -1,17 +1,23 @@
-streamlit==1.37.1
+streamlit==1.36.0
+sqlalchemy>=2.0,<2.1
+pandas>=2.2,<2.3
+Pillow>=10,<11
+numpy>=1.26,<2.1
+ImageHash>=4.3.1
+opencv-python-headless==4.9.0.80
+pycountry>=22.3.5
+qrcode>=7.4.2
+
+# WebRTC (opcional; usa fallback se faltar)
 streamlit-webrtc==0.47.1
-av==10.0.0
+aiortc==1.5.0
+av==11.0.0
 
-Pillow==10.3.0
-opencv-python-headless==4.10.0.84
-imagehash==4.3.1
+# PDF -> imagem (opcional; requer Poppler no SO)
+pdf2image>=1.17.0
 
-pytesseract==0.3.10
+# HEIC (opcional; requer libheif no SO)
+pillow-heif>=0.16.0
 
-google-cloud-vision==3.7.2
-
-pdf2image==1.17.0
-pillow-heif==0.14.0
-
-numpy==1.26.4
-python-dateutil==2.9.0
+# OCR Google (opcional)
+google-cloud-vision>=3.4.5
