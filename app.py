@@ -1371,4 +1371,4 @@ elif st.session_state["screen"] == "admin":
 elif st.session_state["screen"] == "events_admin":
     screen_events_admin()
 else:
-    st.session_state["screen"] = "menu"; screen_menu()
+    st.session_state["screen"] = "menu"; screen_menu() 
