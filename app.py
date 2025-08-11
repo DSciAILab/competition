@@ -1,14 +1,12 @@
 # ================================
-# app.py – ADSS Jiu-Jitsu Competition
-# + Aba Events (admin) para cadastro/gestão de eventos
-# + Seleção de evento ativo antes do menu principal
-# + Todas as ações vinculadas ao evento ativo (event_id)
+# app.py – ADSS Jiu-Jitsu Competition (WebRTC autofocus + lista agrupada)
 # ================================
 
 # ---------- IMPORTS ----------
 import os, re, uuid, urllib.parse, base64, datetime as dt
 from pathlib import Path
 from io import BytesIO
+from types import SimpleNamespace
 
 import pandas as pd
 import streamlit as st
@@ -25,18 +23,12 @@ except Exception:
 
 import imagehash
 
-# streamlit-webrtc (opcional com fallback + stubs p/ evitar NameError)
+# streamlit-webrtc (opcional com fallback)
 WEBRTC_AVAILABLE = True
 try:
     from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase
 except Exception:
     WEBRTC_AVAILABLE = False
-    # Stubs para evitar NameError quando o pacote não está disponível
-    webrtc_streamer = None
-    WebRtcMode = None
-    RTCConfiguration = None
-    class VideoProcessorBase:  # stub
-        pass
 
 # ====== OCR (Google Vision) opcional ======
 USE_VISION_OCR = False
@@ -52,6 +44,7 @@ if USE_VISION_OCR:
     try:
         from google.cloud import vision
         if "GCP_CREDS_B64" in st.secrets:
+            import json
             creds_b64 = st.secrets["GCP_CREDS_B64"]
             cred_path = "gcp_creds.json"
             with open(cred_path, "w") as f:
@@ -82,7 +75,6 @@ st.markdown("""
 .card img { border-radius:8px; }
 .card .meta { font-size:0.95rem; line-height:1.3; }
 .group-title { margin-top:18px; padding:8px 10px; background:#0f1116; border:1px solid #2b2b2b; border-radius:10px; font-weight:700; }
-.help { color:#9aa0a6; font-size:.88rem; margin-top:.25rem;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -101,6 +93,7 @@ WHATSAPP_PHONE = os.getenv("WHATSAPP_ORG", "+9715xxxxxxxx")
 DB_PATH = "registrations.db"
 UPLOAD_DIR = Path("uploads"); UPLOAD_DIR.mkdir(exist_ok=True)
 
+EVENT_DEFAULT_NAME = "ADSS Jiu-Jitsu Competition"
 EVENT_DEFAULT_REGION = "Al Dhafra – Abu Dhabi"
 
 # ================================
@@ -110,13 +103,11 @@ engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
 
 def init_db():
     with engine.begin() as conn:
-        # Tabela de inscrições
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS registrations (
             id TEXT PRIMARY KEY,
             created_at TEXT,
-            event_id TEXT,               -- <- novo: vínculo com events.id
-            event_name TEXT,             -- legibilidade
+            event_name TEXT,
             first_name TEXT,
             last_name TEXT,
             full_name_en TEXT,
@@ -148,21 +139,6 @@ def init_db():
             guardian_eid_photo_path TEXT
         );
         """))
-        # Tabela de eventos
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS events (
-            id TEXT PRIMARY KEY,
-            created_at TEXT,
-            name TEXT,
-            date TEXT,            -- ISO date (yyyy-mm-dd) ou datetime
-            location TEXT,
-            manager TEXT,         -- responsável
-            divisions TEXT,       -- texto livre (divisões ativas)
-            description TEXT,
-            status TEXT           -- 'Ativo' ou 'Inativo'
-        );
-        """))
-        # Migrações tolerantes
         for alter in [
             "ALTER TABLE registrations ADD COLUMN eid TEXT",
             "ALTER TABLE registrations ADD COLUMN weight_kg REAL",
@@ -176,15 +152,12 @@ def init_db():
             "ALTER TABLE registrations ADD COLUMN coach_phone TEXT",
             "ALTER TABLE registrations ADD COLUMN age_years INTEGER",
             "ALTER TABLE registrations ADD COLUMN approval_status TEXT",
-            "ALTER TABLE registrations ADD COLUMN face_phash TEXT",
-            "ALTER TABLE registrations ADD COLUMN event_id TEXT",
-            "ALTER TABLE registrations ADD COLUMN event_name TEXT"
+            "ALTER TABLE registrations ADD COLUMN face_phash TEXT"
         ]:
             try: conn.execute(text(alter))
             except Exception: pass
 init_db()
 
-# ---------- REGISTRATIONS DAO ----------
 def insert_registration(row: dict):
     with engine.begin() as conn:
         cols = ",".join(row.keys()); vals = ",".join([f":{k}" for k in row.keys()])
@@ -196,56 +169,25 @@ def update_registration(reg_id: str, updates: dict):
     with engine.begin() as conn:
         conn.execute(text(f"UPDATE registrations SET {placeholders} WHERE id = :id"), updates)
 
-def fetch_all(event_id: str|None=None):
+def fetch_all():
     with engine.begin() as conn:
-        if event_id:
-            return pd.read_sql("SELECT * FROM registrations WHERE event_id = :e ORDER BY created_at DESC", conn, params={"e": event_id})
         return pd.read_sql("SELECT * FROM registrations ORDER BY created_at DESC", conn)
 
-def fetch_distinct_academies(event_id: str|None=None):
+def fetch_distinct_academies():
     with engine.begin() as conn:
         try:
-            if event_id:
-                rows = conn.execute(text("SELECT DISTINCT academy FROM registrations WHERE event_id=:e AND academy IS NOT NULL AND academy <> ''"), {"e":event_id}).fetchall()
-            else:
-                rows = conn.execute(text("SELECT DISTINCT academy FROM registrations WHERE academy IS NOT NULL AND academy <> ''")).fetchall()
+            rows = conn.execute(text("SELECT DISTINCT academy FROM registrations WHERE academy IS NOT NULL AND academy <> ''")).fetchall()
             return sorted({r[0] for r in rows})
         except Exception:
             return []
 
-def count_by_category(category_value: str, event_id: str|None=None):
+def count_by_category(category_value: str):
     with engine.begin() as conn:
         try:
-            if event_id:
-                row = conn.execute(text("SELECT COUNT(*) FROM registrations WHERE event_id=:e AND category = :c"), {"e":event_id,"c":category_value}).fetchone()
-            else:
-                row = conn.execute(text("SELECT COUNT(*) FROM registrations WHERE category = :c"), {"c":category_value}).fetchone()
+            row = conn.execute(text("SELECT COUNT(*) FROM registrations WHERE category = :c"), {"c": category_value}).fetchone()
             return int(row[0] if row else 0)
         except Exception:
             return 0
-
-# ---------- EVENTS DAO ----------
-def insert_event(row: dict):
-    with engine.begin() as conn:
-        cols = ",".join(row.keys()); vals = ",".join([f":{k}" for k in row.keys()])
-        conn.execute(text(f"INSERT INTO events ({cols}) VALUES ({vals})"), row)
-
-def update_event(event_id: str, updates: dict):
-    placeholders = ", ".join([f"{k} = :{k}" for k in updates.keys()])
-    updates["id"] = event_id
-    with engine.begin() as conn:
-        conn.execute(text(f"UPDATE events SET {placeholders} WHERE id = :id"), updates)
-
-def fetch_events(status: str|None=None):
-    with engine.begin() as conn:
-        if status:
-            return pd.read_sql("SELECT * FROM events WHERE status = :s ORDER BY date ASC, created_at DESC", conn, params={"s":status})
-        return pd.read_sql("SELECT * FROM events ORDER BY date ASC, created_at DESC", conn)
-
-def get_event(event_id: str):
-    with engine.begin() as conn:
-        df = pd.read_sql("SELECT * FROM events WHERE id = :i", conn, params={"i":event_id})
-        return None if df.empty else df.iloc[0].to_dict()
 
 # ================================
 # 4) PIL helper (textbbox compat)
@@ -260,6 +202,7 @@ def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont):
 def _file_to_pil(file_or_pil):
     if file_or_pil is None: return None
     if isinstance(file_or_pil, Image.Image): return file_or_pil
+    # UploadedFile-like
     try:
         return Image.open(BytesIO(file_or_pil.getvalue())).convert("RGB")
     except Exception:
@@ -307,6 +250,7 @@ def phash_distance(a: str, b: str) -> int:
     if not a or not b: return 1_000_000
     return imagehash.hex_to_hash(a) - imagehash.hex_to_hash(b)
 
+# --- Cartão de inscrição (JPEG) ---
 def generate_registration_jpg(row: dict, event_name: str, region: str, logo_file=None, width=1080, height=1350) -> bytes:
     img = Image.new("RGB", (width, height), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
@@ -384,6 +328,7 @@ def generate_registration_jpg(row: dict, event_name: str, region: str, logo_file
 
     buf = BytesIO(); img.save(buf, format="JPEG", quality=90, optimize=True); return buf.getvalue()
 
+# --- Carteirinha (membership) ---
 def generate_membership_card(img_profile_path: str, membership_id: str, eid: str, age: int, name: str, belt: str, width=900, height=600) -> bytes:
     canvas = Image.new("RGB", (width, height), color=(245, 245, 245))
     draw = ImageDraw.Draw(canvas)
@@ -505,6 +450,7 @@ def age_division_by_year(age:int)->str:
     if 41<=age<=45: return "Master 3"
     return "Master 4+"
 
+# Peso -> faixas (bin simples de 5 kg)
 def weight_division(weight_kg: float) -> str:
     if not isinstance(weight_kg, (int, float)) or weight_kg <= 0:
         return "N/D"
@@ -594,71 +540,14 @@ def is_likely_eid_card(image_bytes: bytes, ocr_text: str) -> (bool, float, dict)
     ocr_low = (ocr_text or "").lower()
     eid_found = bool(EID_REGEX.search((ocr_text or "").replace(" ", "")))
     kw_found = any(kw in ocr_low for kw in KEYWORDS_EID)
-    # <-- CUIDADO COM O PARÊNTESE: tudo numa linha para evitar SyntaxError
     score = (0.3 if ratio_ok else 0.0) + (0.5 if eid_found else 0.0) + (0.2 if kw_found else 0.0)
     return (score >= 0.6), score, details
 
-# ---------- HELPERS p/ UPLOAD (jpg/png/heic/pdf) ----------
-def is_pdf_file(uploaded):
-    try:
-        return str(uploaded.name).lower().endswith(".pdf")
-    except Exception:
-        return False
-
-def is_heic_file(uploaded):
-    try:
-        return str(uploaded.name).lower().endswith((".heic", ".heif"))
-    except Exception:
-        return False
-
-def convert_pdf_first_page_to_pil(uploaded):
-    try:
-        data = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
-        from pdf2image import convert_from_bytes
-        pages = convert_from_bytes(data, first_page=1, last_page=1, fmt="jpeg")
-        return pages[0] if pages else None
-    except Exception:
-        return None
-
-def load_any_image_for_ocr(uploaded_or_pil):
-    if isinstance(uploaded_or_pil, Image.Image):
-        return uploaded_or_pil
-    f = uploaded_or_pil
-    if f is None: return None
-    if is_pdf_file(f):
-        img = convert_pdf_first_page_to_pil(f)
-        if img is not None: return img
-    if is_heic_file(f):
-        try:
-            import pillow_heif
-            heif = pillow_heif.read_heif(f.getvalue())
-            img = Image.frombytes(heif.mode, heif.size, heif.data, "raw")
-            return img.convert("RGB")
-        except Exception:
-            pass
-    try:
-        data = f.getvalue() if hasattr(f, "getvalue") else f.read()
-        return Image.open(BytesIO(data)).convert("RGB")
-    except Exception:
-        return None
-
-def save_uploaded_file_as_is(uploaded, reg_id: str, suffix: str) -> str:
-    try:
-        name = str(uploaded.name)
-        ext = Path(name).suffix.lower() or ".bin"
-        dest = UPLOAD_DIR / f"{reg_id}_{suffix}{ext}"
-        data = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
-        with open(dest, "wb") as f:
-            f.write(data)
-        return str(dest)
-    except Exception:
-        return ""
-
-def extract_eid_fields_from_image(uploaded_or_pil, for_guardian=False):
-    img_pil = load_any_image_for_ocr(uploaded_or_pil)
-    if img_pil is None:
-        return {"ok": False, "reason": "Não foi possível ler imagem do documento.", "data": {}}
-    buf = BytesIO(); img_pil.save(buf, format="JPEG"); img_bytes = buf.getvalue()
+def extract_eid_fields_from_image(uploaded_file, for_guardian=False):
+    if uploaded_file is None:
+        return {"ok": False, "reason": "Sem imagem.", "data": {}}
+    img = _file_to_pil(uploaded_file)
+    buf = BytesIO(); img.save(buf, format="JPEG"); img_bytes = buf.getvalue()
     ocr = google_vision_ocr_extract(img_bytes) if USE_VISION_OCR else local_heuristic_extract(img_bytes)
     likely, score, geo = is_likely_eid_card(img_bytes, ocr.get("text",""))
     return {
@@ -675,10 +564,7 @@ def extract_eid_fields_from_image(uploaded_or_pil, for_guardian=False):
 # ================================
 # 8) WEBCAM (streamlit-webrtc) – foco contínuo + captura
 # ================================
-if WEBRTC_AVAILABLE and RTCConfiguration is not None:
-    RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-else:
-    RTC_CFG = None
+RTC_CFG = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 
 class SnapshotProcessor(VideoProcessorBase):
     def __init__(self):
@@ -688,15 +574,20 @@ class SnapshotProcessor(VideoProcessorBase):
         return frame
 
 def webrtc_capture_block(title: str, key_prefix: str, facing="user"):
+    """
+    Renderiza um bloco de câmera via streamlit-webrtc com foco contínuo (quando suportado).
+    Retorna uma PIL Image quando o usuário clica "Capturar foto".
+    """
     st.caption(title)
-    if not WEBRTC_AVAILABLE or webrtc_streamer is None or RTC_CFG is None:
+    if not WEBRTC_AVAILABLE:
         return None, st.camera_input(title + " (fallback)")
     constraints = {
         "video": {
-            "facingMode": facing,
+            "facingMode": facing,          # frontal (selfie) ou "environment"
             "width": {"ideal": 1280},
             "height": {"ideal": 720},
             "frameRate": {"ideal": 30},
+            # Dica para autofocus (browsers que suportam):
             "advanced": [{"focusMode": "continuous"}]
         },
         "audio": False
@@ -709,14 +600,11 @@ def webrtc_capture_block(title: str, key_prefix: str, facing="user"):
         video_processor_factory=SnapshotProcessor,
     )
     snap = None
-    if ctx and getattr(ctx, "video_processor", None):
+    if ctx and ctx.video_processor:
         if st.button(f"Capturar foto – {title}", key=f"btn_{key_prefix}"):
             frame = ctx.video_processor.latest_frame
             if frame is not None:
-                if FACE_DETECT_AVAILABLE:
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                else:
-                    rgb = frame[..., ::-1]
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if FACE_DETECT_AVAILABLE else frame[..., ::-1]
                 snap = Image.fromarray(rgb)
     return snap, None  # (PIL, fallback_uploaded)
 
@@ -725,17 +613,14 @@ def webrtc_capture_block(title: str, key_prefix: str, facing="user"):
 # ================================
 if "screen" not in st.session_state: st.session_state["screen"]="welcome"
 if "accepted_terms" not in st.session_state: st.session_state["accepted_terms"]=False
-if "active_event_id" not in st.session_state: st.session_state["active_event_id"]=None
-if "active_event_name" not in st.session_state: st.session_state["active_event_name"]=""
+if "event_name" not in st.session_state: st.session_state["event_name"]=EVENT_DEFAULT_NAME
 if "region" not in st.session_state: st.session_state["region"]=EVENT_DEFAULT_REGION
 if "errors" not in st.session_state: st.session_state["errors"]=set()
-if "admin_ok" not in st.session_state: st.session_state["admin_ok"]=False
 
 def whatsapp_button(phone: str):
     if not phone or not phone.strip(): return
     phone_clean = phone.replace("+","").replace(" ","").replace("-","")
-    msg = f"Olá! Tenho uma dúvida sobre o evento {st.session_state.get('active_event_name') or 'ADSS'}."
-    url = f"https://wa.me/{phone_clean}?text=" + urllib.parse.quote(msg)
+    url = f"https://wa.me/{phone_clean}?text=" + urllib.parse.quote(f"Olá! Tenho uma dúvida sobre o evento {st.session_state['event_name']}.")
     st.markdown(
         f"""<a href="{url}" target="_blank"
            style="position:fixed;right:20px;bottom:20px;background:#25D366;color:#fff;
@@ -748,8 +633,7 @@ def whatsapp_button(phone: str):
 # 10) TELAS
 # ================================
 def screen_welcome():
-    title = st.session_state.get("active_event_name") or "ADSS Jiu-Jitsu Competition"
-    st.markdown(f"<h1 style='text-align:center;margin:0'>{title}</h1>", unsafe_allow_html=True)
+    st.markdown(f"<h1 style='text-align:center;margin:0'>{st.session_state['event_name']}</h1>", unsafe_allow_html=True)
     st.markdown(f"<p class='header-sub'>{st.session_state['region']}</p>", unsafe_allow_html=True)
     st.markdown("---")
     st.subheader("Bem-vindo(a)!")
@@ -764,34 +648,16 @@ def screen_welcome():
 """)
     agree = st.checkbox("Li e **concordo** com os termos e condições", key="agree_terms")
     st.markdown("---")
-    # Se houver eventos ativos, forçar seleção
-    active_events = fetch_events(status="Ativo")
-    if active_events.empty:
-        st.info("Não há eventos ativos no momento. O administrador pode cadastrar/ativar um evento na aba Events.")
-    else:
-        ev_names = [f"{r['name']} — {r['date'][:10]} — {r['location']}" for _, r in active_events.iterrows()]
-        idx = st.selectbox("Selecione o evento ativo para continuar", options=list(range(len(ev_names))),
-                           format_func=lambda i: ev_names[i], index=0 if st.session_state.get("active_event_id") is None else
-                           max(0, active_events.index[active_events['id']==st.session_state["active_event_id"]].tolist()[0] if (st.session_state["active_event_id"] in set(active_events['id'])) else 0))
-        chosen = active_events.iloc[idx].to_dict()
-        st.markdown(f"<div class='help'>Descrição: {chosen.get('description','')}</div>", unsafe_allow_html=True)
-
     cols = st.columns(2)
     if cols[0].button("Prosseguir"):
-        if not agree:
+        if agree:
+            st.session_state["accepted_terms"]=True; st.session_state["screen"]="menu"
+        else:
             st.error("Você precisa concordar com os termos e condições para continuar.")
-            return
-        if not active_events.empty:
-            st.session_state["active_event_id"] = chosen["id"]
-            st.session_state["active_event_name"] = chosen["name"]
-        st.session_state["accepted_terms"]=True
-        st.session_state["screen"]="menu"
 
 def screen_menu():
-    name = st.session_state.get("active_event_name") or "ADSS Jiu-Jitsu Competition"
-    st.markdown(f"<h1 style='text-align:center;margin:0'>{name}</h1>", unsafe_allow_html=True)
+    st.markdown(f"<h1 style='text-align:center;margin:0'>{st.session_state['event_name']}</h1>", unsafe_allow_html=True)
     st.markdown(f"<p class='header-sub'>{st.session_state['region']}</p>", unsafe_allow_html=True)
-    st.caption("Menu principal — todas as ações referem-se ao evento selecionado acima.")
     if st.button("Novo registro\nPreencher formulário de inscrição", key="menu_new"):
         st.session_state["screen"]="new_registration"; return
     st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
@@ -803,18 +669,16 @@ def screen_menu():
     st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
     if st.button("Gerenciamento da competição (admin)\nAcessar painel do organizador", key="menu_admin"):
         st.session_state["screen"]="admin"; return
-    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-    if st.button("Events (admin)\nCadastrar e ativar eventos", key="menu_events"):
-        st.session_state["screen"]="events_admin"; return
 
 def screen_public_list():
     st.title("Lista de Inscritos (pública)")
-    df = fetch_all(st.session_state.get("active_event_id"))
+    df = fetch_all()
     if df.empty:
-        st.info("Ainda não há inscrições neste evento.")
+        st.info("Ainda não há inscrições.")
         st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
         return
 
+    # Campos auxiliares: ano de nascimento, idade, divisão de peso
     df = df.copy()
     def birth_year(d):
         try:
@@ -828,6 +692,7 @@ def screen_public_list():
     df["age_division"] = df["age_division"].fillna("N/D")
     df["belt"] = df["belt"].fillna("N/D")
 
+    # Agrupamento: Gender / Division / Belt / Weight division
     grouped = df.groupby(["gender","age_division","belt","weight_div"], dropna=False)
 
     for (gender, age_div, belt, wdiv), gdf in grouped:
@@ -836,11 +701,14 @@ def screen_public_list():
             name = f"{row.get('first_name','')} {row.get('last_name','')}".strip()
             status = (row.get("approval_status") or "Pending").strip().lower()
             badge = f"<span class='badge-pending'>Pendente</span>" if status=="pending" else "<span class='badge-approved'>Aprovado</span>"
+            # card
             st.markdown("<div class='card'>", unsafe_allow_html=True)
+            # foto
             if row.get("profile_photo_path") and Path(row["profile_photo_path"]).exists():
                 st.image(row["profile_photo_path"], width=90)
             else:
                 st.image(Image.new("RGB",(90,90),(230,230,230)), width=90)
+            # meta
             meta = []
             by = row.get("birth_year"); ag = row.get("age_years")
             meta.append(f"<b>{name or '(Sem nome)'}</b> {badge}")
@@ -854,9 +722,9 @@ def screen_public_list():
     st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
 
 def stats_view(embed: bool=False):
-    df = fetch_all(st.session_state.get("active_event_id"))
+    df = fetch_all()
     if df.empty:
-        st.info("Ainda não há inscrições neste evento."); return
+        st.info("Ainda não há inscrições."); return
     totals = (df.groupby("category", dropna=False).size().reset_index(name="inscritos")
                 .sort_values("inscritos", ascending=False).reset_index(drop=True))
     if not embed:
@@ -867,8 +735,8 @@ def stats_view(embed: bool=False):
 
 def admin_view():
     st.subheader("Painel do Organizador")
-    df = fetch_all(st.session_state.get("active_event_id"))
-    st.write(f"Total de inscrições neste evento: {len(df)}")
+    df = fetch_all()
+    st.write(f"Total de inscrições: {len(df)}")
     if df.empty:
         st.info("Ainda não há inscrições."); return
     for _, row in df.iterrows():
@@ -879,7 +747,6 @@ def admin_view():
         with st.expander(header, expanded=False):
             meta = {
                 "ID": row.get("id",""),
-                "Evento": row.get("event_name",""),
                 "Nome": name,
                 "E-mail": row.get("email",""),
                 "Telefone": row.get("phone",""),
@@ -902,34 +769,16 @@ def admin_view():
             st.write(meta)
             if row.get("profile_photo_path") and Path(row["profile_photo_path"]).exists():
                 st.image(row["profile_photo_path"], caption="Foto de Perfil", width=160)
-            doc_path = row.get("id_doc_photo_path")
-            if doc_path and Path(doc_path).exists():
-                if doc_path.lower().endswith(".pdf"):
-                    with open(doc_path, "rb") as f:
-                        st.download_button("Baixar documento (PDF)", f, file_name=Path(doc_path).name, mime="application/pdf", key=f"dlpdf_{row['id']}")
-                else:
-                    st.image(doc_path, caption="Documento do atleta", width=220)
+            if row.get("id_doc_photo_path") and Path(row["id_doc_photo_path"]).exists():
+                st.image(row["id_doc_photo_path"], caption="Documento do atleta", width=220)
             if row.get("guardian_eid_photo_path") and Path(row["guardian_eid_photo_path"]).exists():
-                gpath = row["guardian_eid_photo_path"]
-                if gpath.lower().endswith(".pdf"):
-                    with open(gpath, "rb") as f:
-                        st.download_button("Baixar EID do responsável (PDF)", f, file_name=Path(gpath).name, mime="application/pdf", key=f"dlpdfg_{row['id']}")
-                else:
-                    st.image(gpath, caption="EID do responsável", width=220)
+                st.image(row["guardian_eid_photo_path"], caption="EID do responsável", width=220)
 
-            jpg = generate_registration_jpg(row, row.get("event_name","ADSS"), st.session_state["region"])
+            jpg = generate_registration_jpg(row, st.session_state["event_name"], st.session_state["region"])
             st.download_button("Baixar inscrição (JPG)", data=jpg,
                                file_name=f"inscricao_{row['id']}.jpg", mime="image/jpeg",
                                key=f"dl_admin_{row['id']}")
-            try:
-                membership = generate_membership_card(row.get("profile_photo_path",""), row.get("id",""),
-                                                      row.get("eid",""), row.get("age_years",0),
-                                                      name, row.get("belt",""))
-                st.download_button("Baixar carteirinha (JPG)", data=membership,
-                                   file_name=f"membership_{row['id']}.jpg", mime="image/jpeg",
-                                   key=f"dl_member_{row['id']}")
-            except Exception as e:
-                st.warning(f"Não foi possível gerar a carteirinha: {e}")
+
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("Baixar CSV", data=csv, file_name="inscricoes.csv", mime="text/csv")
     st.markdown("---"); stats_view(embed=True)
@@ -939,8 +788,9 @@ def screen_admin_gate():
     st.title("Gerenciamento da Competição (Admin)")
     admin_pw = st.text_input("Senha admin", type="password", placeholder="••••••")
     if st.button("Entrar"):
-        st.session_state["admin_ok"] = (admin_pw == ADMIN_PASSWORD)
-        if not st.session_state["admin_ok"]:
+        if admin_pw == ADMIN_PASSWORD:
+            st.session_state["admin_ok"]=True
+        else:
             st.error("Senha incorreta.")
     if st.session_state.get("admin_ok"): admin_view()
     st.markdown("---")
@@ -966,6 +816,7 @@ def render_edit_form(best_row):
             coach      = st.text_input("Professor/Coach", value=best_row.get("coach",""))
             coach_phone= st.text_input("Telefone do Professor (05_-___-____)", value=best_row.get("coach_phone",""))
         st.markdown("Nova foto de perfil (opcional)")
+        # Captura via WebRTC para edição também
         snap, fallback = webrtc_capture_block("Nova foto de perfil (editar)", f"edit_{best_row['id']}_profile")
         new_profile = snap or fallback
         submitted_update = st.form_submit_button("Salvar alterações")
@@ -997,9 +848,9 @@ def render_edit_form(best_row):
 
 def screen_update_registration():
     st.title("Alterar Inscrição – Identificação")
-    df = fetch_all(st.session_state.get("active_event_id"))
+    df = fetch_all()
     if df.empty:
-        st.info("Não há inscrições para alterar neste evento.")
+        st.info("Não há inscrições para alterar.")
         st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu")); return
     tab1, tab2 = st.tabs(["Face ID (selfie)", "ID da inscrição"])
     with tab1:
@@ -1028,111 +879,12 @@ def screen_update_registration():
         if st.button("Localizar"):
             row = df[df["id"]==regid]
             if row.empty:
-                st.error("ID não encontrado (neste evento).")
+                st.error("ID não encontrado.")
             else:
                 render_edit_form(row.iloc[0])
     st.markdown("---"); st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
 
-# =============== NOVA ABA: EVENTS (ADMIN) ===============
-def screen_events_admin():
-    st.title("Events (Admin) – Cadastro e Gestão de Eventos")
-    if not st.session_state.get("admin_ok"):
-        st.info("Informe a senha de admin para gerenciar eventos.")
-        admin_pw = st.text_input("Senha admin", type="password", placeholder="••••••", key="events_pw")
-        if st.button("Entrar (Events)"):
-            st.session_state["admin_ok"] = (admin_pw == ADMIN_PASSWORD)
-            if not st.session_state["admin_ok"]:
-                st.error("Senha incorreta.")
-        st.markdown("---")
-        st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
-        return
-
-    st.subheader("Criar novo evento")
-    with st.form("new_event_form", clear_on_submit=True):
-        name = st.text_input("Nome do evento*", placeholder="Ex.: ADSS Jiu-Jitsu Summer Open")
-        date_str = st.text_input("Data (yyyy-mm-dd)*", placeholder="2025-09-15")
-        location = st.text_input("Local*", placeholder="Al Dhafra – Abu Dhabi")
-        manager = st.text_input("Responsável*", placeholder="Organizador / Contato")
-        divisions = st.text_area("Divisões ativas", placeholder="Ex.: Gi Kids / Adult / Master; No-Gi Adult ...")
-        description = st.text_area("Descrição", placeholder="Informações gerais, links, observações…")
-        status = st.selectbox("Status*", ["Ativo","Inativo"])
-        created = st.form_submit_button("Criar evento")
-    if created:
-        if not name or not date_str or not location or not manager or not status:
-            st.error("Preencha os campos obrigatórios (*).")
-        else:
-            try:
-                # valida data simples
-                _ = dt.date.fromisoformat(date_str)
-                ev = {
-                    "id": str(uuid.uuid4())[:8].upper(),
-                    "created_at": dt.datetime.utcnow().isoformat(),
-                    "name": name.strip(),
-                    "date": date_str.strip(),
-                    "location": location.strip(),
-                    "manager": manager.strip(),
-                    "divisions": divisions.strip(),
-                    "description": description.strip(),
-                    "status": status
-                }
-                insert_event(ev)
-                st.success("Evento criado com sucesso.")
-            except Exception as e:
-                st.error(f"Erro ao criar evento: {e}")
-
-    st.subheader("Eventos existentes")
-    ev_df = fetch_events()
-    if ev_df.empty:
-        st.info("Nenhum evento cadastrado.")
-    else:
-        for _, r in ev_df.iterrows():
-            with st.expander(f"{r['name']} — {r['date'][:10]} — {r['location']}  [{r['status']}]"):
-                st.write({
-                    "ID": r["id"],
-                    "Nome": r["name"],
-                    "Data": r["date"],
-                    "Local": r["location"],
-                    "Responsável": r["manager"],
-                    "Divisões": r.get("divisions",""),
-                    "Descrição": r.get("description",""),
-                    "Status": r["status"]
-                })
-                with st.form(f"edit_{r['id']}"):
-                    ename = st.text_input("Nome", value=r["name"])
-                    edate = st.text_input("Data (yyyy-mm-dd)", value=r["date"])
-                    eloc  = st.text_input("Local", value=r["location"])
-                    emag  = st.text_input("Responsável", value=r["manager"])
-                    ediv  = st.text_area("Divisões ativas", value=r.get("divisions",""))
-                    edesc = st.text_area("Descrição", value=r.get("description",""))
-                    est   = st.selectbox("Status", ["Ativo","Inativo"], index=0 if r["status"]=="Ativo" else 1)
-                    save  = st.form_submit_button("Salvar alterações")
-                if save:
-                    try:
-                        _ = dt.date.fromisoformat(edate)
-                        update_event(r["id"], {
-                            "name": ename.strip(),
-                            "date": edate.strip(),
-                            "location": eloc.strip(),
-                            "manager": emag.strip(),
-                            "divisions": ediv.strip(),
-                            "description": edesc.strip(),
-                            "status": est
-                        })
-                        st.success("Evento atualizado.")
-                    except Exception as e:
-                        st.error(f"Erro ao atualizar: {e}")
-
-    st.markdown("---")
-    st.button("Voltar ao menu principal", on_click=lambda: st.session_state.update(screen="menu"))
-
-# =============== NOVO REGISTRO (agora vinculado ao evento ativo) ===============
 def screen_new_registration():
-    # Guard: precisa de evento ativo
-    if not st.session_state.get("active_event_id"):
-        st.warning("Selecione um evento ativo na tela inicial antes de registrar.")
-        st.button("Voltar ao início", on_click=lambda: st.session_state.update(screen="welcome"))
-        return
-
     # Máscaras live
     for k in ["phone","coach_phone","guardian_phone"]:
         if k in st.session_state: st.session_state[k] = format_phone_live(st.session_state[k])
@@ -1156,7 +908,7 @@ def screen_new_registration():
         if data.get("eid"): st.session_state["guardian_eid"] = eid_format_live(data["eid"])
         if data.get("full_name"): st.session_state["guardian_name"] = title_capitalize(data["full_name"])
 
-    st.title(f"Formulário de Inscrição — {st.session_state.get('active_event_name')}")
+    st.title("Formulário de Inscrição")
     st.caption("Preencha seus dados. Campos com * são obrigatórios.")
 
     # PESSOAIS
@@ -1178,7 +930,7 @@ def screen_new_registration():
 
     # ACADEMIA
     st.subheader("Academia")
-    academies = fetch_distinct_academies(st.session_state.get("active_event_id"))
+    academies = fetch_distinct_academies()
     options = ["Selecione...", "Minha academia não está na lista"] + academies
     academy_choice = st.selectbox("Academia*", options, key="academy_choice", index=st.session_state.get("academy_choice_idx", 0))
     academy_other = ""
@@ -1187,27 +939,22 @@ def screen_new_registration():
     coach      = st.text_input("Professor/Coach", key="coach", placeholder="Nome do coach")
     coach_phone= st.text_input("Telefone do Professor (05_-___-____)", key="coach_phone", placeholder="052-123-4567")
 
-    # --- DOCUMENTOS ---
+    # DOCUMENTOS – captura com WebRTC (foco contínuo) + fallback
     st.subheader("Documentos")
+    # Perfil (selfie): usar câmera frontal
     snap_prof, fb_prof = webrtc_capture_block("Foto de Perfil (rosto visível)*", "profile_selfie", facing="user")
     profile_img = snap_prof or fb_prof
+    # EID atleta: usar câmera traseira (se disponível)
+    snap_id, fb_id = webrtc_capture_block("EID do atleta (frente)*", "athlete_eid", facing="environment")
+    id_doc_img = snap_id or fb_id
 
-    doc_opt = st.radio("Como fornecer o documento do atleta?", ["Tirar foto agora", "Enviar arquivo (jpg/png/heic/pdf)"],
-                       index=0, horizontal=True)
-    id_doc_source = None
-    if doc_opt == "Tirar foto agora":
-        snap_id, fb_id = webrtc_capture_block("EID do atleta (frente)*", "athlete_eid", facing="environment")
-        id_doc_source = snap_id or fb_id
-    else:
-        id_doc_upload = st.file_uploader("Enviar arquivo do documento*", type=["jpg","jpeg","png","heic","pdf"], key="id_doc_upload")
-        id_doc_source = id_doc_upload
-
+    # Ler dados da EID (atleta)
     colx, _ = st.columns([1,4])
     with colx:
         if st.button("Ler dados da EID do atleta"):
-            res = extract_eid_fields_from_image(id_doc_source)
+            res = extract_eid_fields_from_image(id_doc_img)
             if not res["ok"]:
-                st.warning(f"Foto/arquivo pode não ser uma EID ({res['reason']}). Mesmo assim tentando aproveitar dados extraídos.")
+                st.warning(f"Foto pode não ser uma EID ({res['reason']}). Mesmo assim tentando aproveitar dados extraídos.")
             st.session_state["ocr_apply_atleta"] = res.get("data", {})
             st.rerun()
 
@@ -1255,12 +1002,11 @@ def screen_new_registration():
         for k in must:
             if not st.session_state.get(k): errors.add(k)
         if profile_img is None: errors.add("profile_img")
-        if id_doc_source is None: errors.add("id_doc_img")
+        if id_doc_img is None: errors.add("id_doc_img")
         if st.session_state.get("academy_choice") == "Minha academia não está na lista" and not st.session_state.get("academy_other"):
             errors.add("academy_other")
         if st.session_state.get("eid") and not eid_is_valid(st.session_state["eid"]):
             errors.add("eid"); st.error("EID do atleta inválido. Use o formato 784-####-#######-#.")
-        dob_date = parse_masked_date(st.session_state.get("dob",""))
         if dob_date is None:
             errors.add("dob"); st.error("Data de nascimento inválida. Use dd/mm/aaaa.")
         if "profile_img" not in errors and profile_img is not None:
@@ -1272,8 +1018,6 @@ def screen_new_registration():
                     errors.add("profile_img"); st.error("A foto de perfil não parece conter um rosto.")
                 elif faces_profile > 1:
                     errors.add("profile_img"); st.error("Detectamos mais de uma pessoa na foto de perfil.")
-        if dob_date:
-            age_years = compute_age_year_based(dob_date.year)
         if age_years and age_years < 18:
             if not st.session_state.get("guardian_name"): errors.add("guardian_name")
             if not st.session_state.get("guardian_eid") or not eid_is_valid(st.session_state.get("guardian_eid","")):
@@ -1298,21 +1042,17 @@ def screen_new_registration():
         age_div = age_division_by_year(age_years)
         category = age_div
 
-        # salvar imagens e documento
+        # salvar imagens
         reg_id = str(uuid.uuid4())[:8].upper()
         profile_photo_path = save_image(profile_img, reg_id, "profile")
-        if isinstance(id_doc_source, Image.Image):
-            id_doc_photo_path = save_image(id_doc_source, reg_id, "id_doc")
-        else:
-            id_doc_photo_path = save_uploaded_file_as_is(id_doc_source, reg_id, "id_doc")
+        id_doc_photo_path = save_image(id_doc_img, reg_id, "id_doc")
         guardian_eid_photo_path = save_image(guardian_eid_photo, reg_id, "guardian_eid") if guardian_eid_photo else ""
         face_crop_img = crop_face_from_uploaded(profile_img)
         face_phash = compute_phash(face_crop_img)
 
         row = {
             "id": reg_id, "created_at": dt.datetime.utcnow().isoformat(),
-            "event_id": st.session_state.get("active_event_id"),    # vínculo
-            "event_name": st.session_state.get("active_event_name"),
+            "event_name": st.session_state["event_name"],
             "first_name": first_name, "last_name": last_name, "full_name_en": full_name_en,
             "email": st.session_state["email"].strip(), "phone": phone, "eid": eid_masked,
             "nationality": st.session_state["nationality"], "gender": st.session_state["gender"],
@@ -1333,18 +1073,10 @@ def screen_new_registration():
             insert_registration(row)
             st.success(f"Inscrição enviada com sucesso. ID (Membership): {reg_id}")
             st.info("Status da sua inscrição: Pendente de aprovação.")
-            st.info(f"Atletas já inscritos na categoria '{category}': {count_by_category(category, st.session_state.get('active_event_id'))}")
+            st.info(f"Atletas já inscritos na categoria '{category}': {count_by_category(category)}")
 
-            jpg_bytes = generate_registration_jpg(row, row.get("event_name","ADSS"), st.session_state["region"])
+            jpg_bytes = generate_registration_jpg(row, st.session_state["event_name"], st.session_state["region"])
             st.download_button("Baixar inscrição (JPG)", data=jpg_bytes, file_name=f"inscricao_{row['id']}.jpg", mime="image/jpeg")
-
-            try:
-                member_card = generate_membership_card(profile_photo_path, reg_id, eid_masked, age_years,
-                                                       f"{first_name} {last_name}", st.session_state["belt"])
-                st.download_button("Baixar carteirinha (JPG)", data=member_card, file_name=f"membership_{reg_id}.jpg", mime="image/jpeg")
-                st.image(member_card, caption="Pré-visualização da carteirinha", use_column_width=True)
-            except Exception as e:
-                st.warning(f"Não foi possível gerar a carteirinha: {e}")
         except Exception as e:
             st.error(f"Erro ao salvar inscrição: {e}")
 
@@ -1368,7 +1100,5 @@ elif st.session_state["screen"] == "public_list":
     screen_public_list()
 elif st.session_state["screen"] == "admin":
     screen_admin_gate()
-elif st.session_state["screen"] == "events_admin":
-    screen_events_admin()
 else:
     st.session_state["screen"] = "menu"; screen_menu()
