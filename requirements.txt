@@ -7,7 +7,6 @@ ImageHash>=4.3.1
 pycountry>=22.3.5
 qrcode>=7.4.2
 
-# Opcional (câmera avançada com autofoco + face detect)
 streamlit-webrtc==0.47.1
 aiortc==1.5.0
 av==11.0.0
